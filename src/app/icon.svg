@@ -1,0 +1,45 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="64" height="64" rx="14" fill="#15264A"/>
+  <g stroke="#FFFFFF" stroke-width="2.1" stroke-linecap="round">
+    <!-- spokes: center → 8 nodes -->
+    <line x1="32" y1="32" x2="32" y2="8"/>
+    <line x1="32" y1="32" x2="48.97" y2="15.03"/>
+    <line x1="32" y1="32" x2="56" y2="32"/>
+    <line x1="32" y1="32" x2="48.97" y2="48.97"/>
+    <line x1="32" y1="32" x2="32" y2="56"/>
+    <line x1="32" y1="32" x2="15.03" y2="48.97"/>
+    <line x1="32" y1="32" x2="8" y2="32"/>
+    <line x1="32" y1="32" x2="15.03" y2="15.03"/>
+    <!-- ring: adjacent nodes -->
+    <line x1="32" y1="8" x2="48.97" y2="15.03"/>
+    <line x1="48.97" y1="15.03" x2="56" y2="32"/>
+    <line x1="56" y1="32" x2="48.97" y2="48.97"/>
+    <line x1="48.97" y1="48.97" x2="32" y2="56"/>
+    <line x1="32" y1="56" x2="15.03" y2="48.97"/>
+    <line x1="15.03" y1="48.97" x2="8" y2="32"/>
+    <line x1="8" y1="32" x2="15.03" y2="15.03"/>
+    <line x1="15.03" y1="15.03" x2="32" y2="8"/>
+    <!-- chords: skip-one (crossings) -->
+    <line x1="32" y1="8" x2="56" y2="32"/>
+    <line x1="48.97" y1="15.03" x2="48.97" y2="48.97"/>
+    <line x1="56" y1="32" x2="32" y2="56"/>
+    <line x1="48.97" y1="48.97" x2="15.03" y2="48.97"/>
+    <line x1="32" y1="56" x2="8" y2="32"/>
+    <line x1="15.03" y1="48.97" x2="15.03" y2="15.03"/>
+    <line x1="8" y1="32" x2="32" y2="8"/>
+    <line x1="15.03" y1="15.03" x2="48.97" y2="15.03"/>
+  </g>
+  <g fill="#FFFFFF">
+    <!-- 8 outer nodes -->
+    <circle cx="32" cy="8" r="4.5"/>
+    <circle cx="48.97" cy="15.03" r="4.5"/>
+    <circle cx="56" cy="32" r="4.5"/>
+    <circle cx="48.97" cy="48.97" r="4.5"/>
+    <circle cx="32" cy="56" r="4.5"/>
+    <circle cx="15.03" cy="48.97" r="4.5"/>
+    <circle cx="8" cy="32" r="4.5"/>
+    <circle cx="15.03" cy="15.03" r="4.5"/>
+    <!-- center hub -->
+    <circle cx="32" cy="32" r="7"/>
+  </g>
+</svg>
