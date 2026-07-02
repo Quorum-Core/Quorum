@@ -1,20 +1,26 @@
 import { isDemoMode, DEMO_DECISIONS } from '../../../lib/demo-data';
 import { NextRequest, NextResponse } from 'next/server';
-import { dbDelete, dbGet, dbQuery, getDecisions, saveDecision, updateDecision } from '@/lib/db';
-import { isTerminal } from '@/lib/decision-status';
+import { authorizedBrowser, authorized } from '@/lib/api-guard';
+import { dbDelete, dbGet, dbQuery, getDecisions, saveDecision, updateDecision, transitionDecisionStatus, softDeleteDecision } from '@/lib/db';
+import { canTransition } from '@/lib/decision-status';
 
 export async function GET(req: NextRequest) {
+  if (!authorized(req)) return NextResponse.json({ error: 'forbidden' }, { status: 403 }); // #107: 민감 read 가드(same-origin/token)
   if (isDemoMode()) return Response.json(DEMO_DECISIONS);
   const status = stripEq(req.nextUrl.searchParams.get('status'));
   const triggerSource = stripEq(req.nextUrl.searchParams.get('trigger_source'));
   const agentId = stripEq(req.nextUrl.searchParams.get('agent_id'));
-  const limit = parseInt(req.nextUrl.searchParams.get('limit') || '20');
+  const limit = parseLimit(req.nextUrl.searchParams.get('limit'), 20, 100);
   const order = req.nextUrl.searchParams.get('order');
-  const fetchLimit = agentId ? Math.max(limit * 5, 50) : limit;
+  if (status && !DECISION_GET_STATUSES.has(status)) return NextResponse.json({ error: 'status invalid' }, { status: 400 });
+  if (triggerSource && !isSafeFilterValue(triggerSource)) return NextResponse.json({ error: 'trigger_source invalid' }, { status: 400 });
+  if (agentId && !isSafeFilterValue(agentId)) return NextResponse.json({ error: 'agent_id invalid' }, { status: 400 });
+  const fetchLimit = agentId ? Math.min(Math.max(limit * 5, 50), 500) : limit;
 
-  const decisions = triggerSource
+  const useDbQuery = triggerSource || parseOrderColumn(order);
+  const decisions = useDbQuery
     ? await dbQuery('decisions', {
-        where: { trigger_source: triggerSource, ...(status ? { status } : {}) },
+        where: { ...(triggerSource ? { trigger_source: triggerSource } : {}), ...(status ? { status } : {}) },
         orderBy: parseOrderColumn(order) || 'created_at',
         ascending: parseOrderAscending(order) ?? false,
         limit: fetchLimit,
@@ -29,9 +35,12 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+  if (!authorizedBrowser(req)) return NextResponse.json({ error: 'forbidden' }, { status: 403 }); // #75
   try {
-    const body = await req.json();
-    const decision = await saveDecision(body);
+    const body = await req.json().catch(() => null);
+    const input = sanitizeDecisionCreate(body);
+    if ('error' in input) return NextResponse.json({ error: input.error }, { status: 400 });
+    const decision = await saveDecision(input.value);
     if (!decision) {
       return NextResponse.json({ error: 'DB insert returned no row (check table columns/RLS)' }, { status: 500 });
     }
@@ -43,35 +52,63 @@ export async function POST(req: NextRequest) {
 }
 
 export async function PATCH(req: NextRequest) {
-  const body = await req.json();
-  const rawId = body.id || req.nextUrl.searchParams.get('id');
-  const id = typeof rawId === 'string' ? stripEq(rawId) : rawId;
-  const updates = { ...body };
-  delete updates.id;
-  if (!id) return NextResponse.json({ error: 'id required' }, { status: 400 });
-  // 확정된 의사결정의 status를 raw PATCH로 되돌리지 못하게 차단(status 외 필드 갱신은 허용)
-  if (updates.status !== undefined) {
-    const cur = await dbGet('decisions', id) as { status?: string } | undefined;
-    if (cur && isTerminal(cur.status)) {
-      return NextResponse.json({ error: 'Decision already finalized', status: cur.status }, { status: 409 });
+  if (!authorizedBrowser(req)) return NextResponse.json({ error: 'forbidden' }, { status: 403 }); // #75
+  try {
+    const body = await req.json().catch(() => null);
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return NextResponse.json({ error: 'invalid body' }, { status: 400 });
+    const row = body as Record<string, unknown>;
+    const queryId = stripEq(req.nextUrl.searchParams.get('id'));
+    const bodyId = typeof row.id === 'string' ? stripEq(row.id) : undefined;
+    const id = normalizeDecisionId(bodyId || queryId);
+    if (!id) return NextResponse.json({ error: 'id invalid' }, { status: 400 });
+    const input = sanitizeDecisionUpdate(row);
+    if ('error' in input) return NextResponse.json({ error: input.error }, { status: 400 });
+    const updates = input.value;
+    // #95: status PATCH는 CAS(terminal이면 거부) + allowlist. read-then-write race로 종결상태 덮어쓰기 차단.
+    if (updates.status !== undefined) {
+      // #100: 실제 사용 status 전부 — approval_requested(결재요청)·deleted(소프트딜리트) 누락 회귀 복구.
+      if (typeof updates.status !== 'string' || !DECISION_PATCH_STATUSES.has(updates.status)) return NextResponse.json({ error: 'invalid status' }, { status: 400 });
+      // #106: 소프트삭제는 terminal(완료/거절) 출발도 허용해야 함(숨김). 전용 경로로 — transition CAS는 terminal 출발을 막으므로.
+      if (updates.status === 'deleted') {
+        const ok = await softDeleteDecision(id);
+        if (!ok) return NextResponse.json({ error: 'already deleted or not found' }, { status: 409 });
+        return NextResponse.json(await dbGet('decisions', id));
+      }
+      // #102: 비정상 전이 차단(pending→completed 점프·approved→pending 역행 등).
+      const curD = await dbGet('decisions', id) as { status?: string } | undefined;
+      if (curD && !canTransition(curD.status, updates.status)) {
+        return NextResponse.json({ error: 'invalid transition', from: curD.status, to: updates.status }, { status: 409 });
+      }
+      // #101: from을 CAS로 고정 — read→write 사이 status가 바뀌면 패배(stale 전이 차단). terminal 출발도 차단.
+      const ok = await transitionDecisionStatus(id, String(curD?.status ?? ''), serializeJsonFields(updates));
+      if (!ok) {
+        const f = await dbGet('decisions', id) as { status?: string } | undefined;
+        return NextResponse.json({ error: 'status changed or finalized', status: f?.status }, { status: 409 });
+      }
+      return NextResponse.json(await dbGet('decisions', id));
     }
+    const result = await updateDecision(id, serializeJsonFields(updates));
+    return NextResponse.json(result);
+  } catch (error) {
+    console.error('API error:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
-  const result = await updateDecision(id, serializeJsonFields(updates));
-  return NextResponse.json(result);
 }
 
 export async function DELETE(req: NextRequest) {
+  if (!authorizedBrowser(req)) return NextResponse.json({ error: 'forbidden' }, { status: 403 }); // #75
   try {
     let id = stripEq(req.nextUrl.searchParams.get('id'));
     if (!id) {
       try {
         const body = await req.json();
-        id = typeof body.id === 'string' ? stripEq(body.id) : body.id;
+        id = body && typeof body === 'object' && !Array.isArray(body) && typeof body.id === 'string' ? stripEq(body.id) : undefined;
       } catch {}
     }
-    if (!id) return NextResponse.json({ error: 'id required' }, { status: 400 });
-    await dbDelete('decisions', id);
-    await dbDelete('directives', id);
+    const safeId = normalizeDecisionId(id);
+    if (!safeId) return NextResponse.json({ error: 'id invalid' }, { status: 400 });
+    await dbDelete('decisions', safeId);
+    await dbDelete('directives', safeId);
     return NextResponse.json({ success: true });
   } catch (error) {
     console.error('API error:', error);
@@ -84,8 +121,25 @@ function stripEq(value: string | null): string | undefined {
   return value.startsWith('eq.') ? value.slice(3) : value;
 }
 
+function parseLimit(value: string | null, fallback: number, max: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return Math.min(Math.floor(n), max);
+}
+
+function normalizeDecisionId(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9-]{1,100}$/.test(trimmed) ? trimmed : null;
+}
+
+function isSafeFilterValue(value: string): boolean {
+  return /^[A-Za-z0-9_-]{1,100}$/.test(value);
+}
+
 function parseOrderColumn(order: string | null): string | undefined {
-  return order?.split('.')[0] || undefined;
+  const col = order?.split('.')[0];
+  return col && DECISION_ORDER_COLUMNS.has(col) ? col : undefined;
 }
 
 function parseOrderAscending(order: string | null): boolean | undefined {
@@ -119,6 +173,131 @@ function serializeJsonFields(updates: Record<string, unknown>): Record<string, u
     }
   }
   return next;
+}
+
+const DECISION_CREATE_STATUSES = new Set(['pending', 'approved', 'rejected', 'completed', 'completed_with_errors']);
+const DECISION_PATCH_STATUSES = new Set(['pending', 'approval_requested', 'approved', 'rejected', 'in_progress', 'executing', 'completed', 'completed_with_errors', 'deleted']);
+const DECISION_CREATE_PRIORITIES = new Set(['low', 'medium', 'normal', 'high', 'urgent']);
+const DECISION_GET_STATUSES = new Set(['pending', 'approval_requested', 'approved', 'rejected', 'in_progress', 'executing', 'completed', 'completed_with_errors', 'deleted']);
+const DECISION_TEXT_LIMITS: Record<string, number> = {
+  title: 200,
+  description: 5000,
+  source_agent: 100,
+  trigger_source: 100,
+  trigger_agent_id: 100,
+  analysis: 10000,
+  verification: 10000,
+  counsel_summary: 10000,
+  final_decision: 20000,
+  meeting_id: 100,
+  review_notes: 5000,
+};
+const DECISION_SAFE_ID_FIELDS = new Set(['source_agent', 'trigger_source', 'trigger_agent_id', 'meeting_id']);
+const DECISION_ORDER_COLUMNS = new Set([
+  'id',
+  'title',
+  'type',
+  'status',
+  'priority',
+  'source_agent',
+  'trigger_source',
+  'trigger_agent_id',
+  'created_at',
+  'updated_at',
+]);
+
+function sanitizeDecisionCreate(body: unknown): { value: Record<string, unknown> } | { error: string } {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { error: 'invalid body' };
+  const row = body as Record<string, unknown>;
+  if (typeof row.title !== 'string' || !row.title.trim() || row.title.length > 200) return { error: 'title invalid' };
+
+  const out: Record<string, unknown> = { title: row.title.trim() };
+  const copyText = (key: string, limit: number): string | undefined => {
+    const value = row[key];
+    if (value == null) return undefined;
+    if (typeof value !== 'string' || value.length > limit) return `${key} invalid`;
+    const normalized = DECISION_SAFE_ID_FIELDS.has(key) ? normalizeLookupId(value) : value;
+    if (normalized == null) return `${key} invalid`;
+    out[key] = normalized;
+    return undefined;
+  };
+
+  for (const [key, limit] of Object.entries(DECISION_TEXT_LIMITS)) {
+    if (key === 'title') continue;
+    const error = copyText(key, limit);
+    if (error) return { error };
+  }
+
+  if (row.type != null) {
+    if (typeof row.type !== 'string' || row.type.length > 50 || !/^[\w-]+$/.test(row.type)) return { error: 'type invalid' };
+    out.type = row.type;
+  }
+  if (row.status != null) {
+    if (typeof row.status !== 'string' || !DECISION_CREATE_STATUSES.has(row.status)) return { error: 'invalid status' };
+    out.status = row.status;
+  }
+  if (row.priority != null) {
+    if (typeof row.priority !== 'string' || !DECISION_CREATE_PRIORITIES.has(row.priority)) return { error: 'priority invalid' };
+    out.priority = row.priority;
+  }
+  if (row.delegation_level != null) {
+    if (typeof row.delegation_level !== 'number' || !Number.isInteger(row.delegation_level) || row.delegation_level < 1 || row.delegation_level > 5) return { error: 'delegation_level invalid' };
+    out.delegation_level = row.delegation_level;
+  }
+
+  for (const key of ['trigger_data', 'progress']) {
+    const value = row[key];
+    if (value == null) continue;
+    const encoded = typeof value === 'string' ? value : JSON.stringify(value);
+    if (encoded.length > 20000) return { error: `${key} too long` };
+    out[key] = encoded;
+  }
+
+  return { value: out };
+}
+
+function sanitizeDecisionUpdate(row: Record<string, unknown>): { value: Record<string, unknown> } | { error: string } {
+  const out: Record<string, unknown> = {};
+  for (const [key, limit] of Object.entries(DECISION_TEXT_LIMITS)) {
+    if (!(key in row)) continue;
+    const value = row[key];
+    if (typeof value !== 'string' || value.length > limit) return { error: key === 'title' ? 'title invalid' : `${key} invalid` };
+    const trimmed = key === 'title' ? value.trim() : value;
+    if (key === 'title' && !trimmed) return { error: 'title invalid' };
+    const normalized = DECISION_SAFE_ID_FIELDS.has(key) ? normalizeLookupId(trimmed) : trimmed;
+    if (normalized == null) return { error: `${key} invalid` };
+    out[key] = normalized;
+  }
+  if ('type' in row) {
+    if (typeof row.type !== 'string' || row.type.length > 50 || !/^[\w-]+$/.test(row.type)) return { error: 'type invalid' };
+    out.type = row.type;
+  }
+  if ('status' in row) {
+    if (typeof row.status !== 'string' || !DECISION_PATCH_STATUSES.has(row.status)) return { error: 'invalid status' };
+    out.status = row.status;
+  }
+  if ('priority' in row) {
+    if (typeof row.priority !== 'string' || !DECISION_CREATE_PRIORITIES.has(row.priority)) return { error: 'priority invalid' };
+    out.priority = row.priority;
+  }
+  if ('delegation_level' in row) {
+    if (typeof row.delegation_level !== 'number' || !Number.isInteger(row.delegation_level) || row.delegation_level < 1 || row.delegation_level > 5) return { error: 'delegation_level invalid' };
+    out.delegation_level = row.delegation_level;
+  }
+  for (const key of ['trigger_data', 'progress']) {
+    if (!(key in row)) continue;
+    const value = row[key];
+    if (value == null) continue;
+    const encoded = typeof value === 'string' ? value : JSON.stringify(value);
+    if (encoded.length > 20000) return { error: `${key} too long` };
+    out[key] = encoded;
+  }
+  return { value: out };
+}
+
+function normalizeLookupId(value: string): string | null {
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9_-]{1,100}$/.test(trimmed) ? trimmed : null;
 }
 
 function matchesAgent(decision: unknown, agentId: string): boolean {

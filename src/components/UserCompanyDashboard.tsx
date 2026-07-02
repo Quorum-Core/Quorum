@@ -59,27 +59,43 @@ const AGENT_FLOOR: Record<string, number> = {
 export default function UserCompanyDashboard({ company, lang, onClose }: Props) {
   const ko = lang === 'ko';
   const [reports, setReports] = useState<Report[]>([]);
+  const [loading, setLoading] = useState(true); // 최초 로드 로딩(빈 상태와 구분)
+  const [error, setError] = useState(false);    // 조회 실패(빈 상태와 구분)
   const [chatAgent, setChatAgent] = useState<string | null>(null);
 
-  // Load reports for this company's agents
+  // Load reports for this company's agents — 마운트 후 활성 동안 5초 폴링(다른 패널과 동일).
   useEffect(() => {
+    let cancelled = false;
     const loadReports = async () => {
-                  
       try {
         // reports 라우트는 or= 미지원 → 전체 조회 후 회사 에이전트·연결일 기준 클라이언트 필터
         const res = await fetch('/api/reports?limit=50');
-        if (res.ok) {
-          const all = await res.json();
-          const agentSet = new Set(company.agents);
-          const since = company.connectedAt ? new Date(company.connectedAt).getTime() : 0;
-          const filtered = (Array.isArray(all) ? all : []).filter((r: { agent_id?: string; created_at?: string }) =>
-            agentSet.has(r.agent_id || '') && (!since || new Date(r.created_at || 0).getTime() >= since)
-          );
-          setReports(filtered.slice(0, 10));
-        }
-      } catch { /* */ }
+        if (!res.ok) { if (!cancelled) setError(true); return; }
+        const all = await res.json();
+        const agentSet = new Set(company.agents);
+        const since = company.connectedAt ? new Date(company.connectedAt).getTime() : 0;
+        const filtered = (Array.isArray(all) ? all : []).filter((r: { agent_id?: string; created_at?: string; report_type?: string; content?: string }) => {
+          const isMeeting = r.report_type === 'meeting';
+          // 회의는 팀 산출물 — 연결일(connectedAt) 무관하게 표시. 그 외 report만 연결일 필터.
+          if (!isMeeting && since && new Date(r.created_at || 0).getTime() < since) return false;
+          if (agentSet.has(r.agent_id || '')) return true;
+          // 회의는 저자(lead) 대신 참석자 중 회사 에이전트가 있으면 표시(#저자단일 사각지대).
+          if (isMeeting && r.content) {
+            try {
+              const p = (JSON.parse(r.content) as { participants?: unknown }).participants;
+              const ids = Array.isArray(p) ? p.map((x) => (typeof x === 'string' ? x : (x as { id?: string })?.id)).filter(Boolean) : [];
+              return ids.some((id) => agentSet.has(id as string));
+            } catch { /* content 파싱 실패 → 제외 */ }
+          }
+          return false;
+        });
+        if (!cancelled) { setReports(filtered.slice(0, 10)); setError(false); }
+      } catch { if (!cancelled) setError(true); }
+      finally { if (!cancelled) setLoading(false); }
     };
     loadReports();
+    const iv = setInterval(() => { if (!document.hidden) loadReports(); }, 5000);
+    return () => { cancelled = true; clearInterval(iv); };
   }, [company.agents, company.connectedAt]);
 
   // 연결 경과일(표시용 근사값) — 실시간 갱신 불필요. Date.now()는 렌더 시 1회 읽음.
@@ -205,7 +221,11 @@ export default function UserCompanyDashboard({ company, lang, onClose }: Props) 
           <div className="bg-white/5 border border-white/10 rounded-xl p-8 text-center">
             <Zap className="w-8 h-8 text-gray-600 mx-auto mb-3" />
             <p className="text-gray-500 text-sm">
-              {ko ? '에이전트가 분석 중입니다. 첫 리포트가 곧 도착합니다.' : 'Agents are analyzing. First reports arriving soon.'}
+              {loading
+                ? (ko ? '리포트를 불러오는 중…' : 'Loading reports…')
+                : error
+                ? (ko ? '리포트를 불러오지 못했습니다. 잠시 후 자동 재시도합니다.' : 'Failed to load reports. Retrying automatically.')
+                : (ko ? '에이전트가 분석 중입니다. 첫 리포트가 곧 도착합니다.' : 'Agents are analyzing. First reports arriving soon.')}
             </p>
           </div>
         ) : (

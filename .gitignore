@@ -49,3 +49,6 @@ AIHQ_소개.pdf
 *.pdf
 bundled/
 supabase/.temp/
+
+# eval 로컬 실측 산출물
+scripts/*.local.*

@@ -20,11 +20,12 @@ function inCidr4(ip: number, base: string, bits: number): boolean {
   return (ip & mask) === (b & mask);
 }
 
-// 차단 IPv4 범위: 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.168/16, multicast/reserved.
+// 차단 IPv4 범위: private/link-local/benchmark/docs/multicast/reserved 등 외부 MCP 대상이 될 수 없는 special-use.
 const BLOCKED_V4: Array<[string, number]> = [
   ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8],
   ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.168.0.0', 16],
-  ['192.0.0.0', 24], ['192.0.2.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4],
+  ['192.0.0.0', 24], ['192.0.2.0', 24], ['198.18.0.0', 15], ['198.51.100.0', 24],
+  ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4],
 ];
 
 // IPv4-mapped IPv6를 내부 v4로 환산: ::ffff:1.2.3.4 / ::ffff:7f00:1(hex) / 0:0:0:0:0:ffff:7f00:1(비압축).
@@ -64,6 +65,7 @@ export function checkMcpUrl(raw: string): UrlCheck {
   let u: URL;
   try { u = new URL(raw); } catch { return { ok: false, reason: 'invalid url' }; }
   if (u.protocol !== 'https:') return { ok: false, reason: 'https only' };
+  if (u.username || u.password) return { ok: false, reason: 'userinfo not allowed' };
   const host = u.hostname.replace(/^\[|\]$/g, '');
   // IP 리터럴이면 바로 검사(DNS 우회 시도 차단)
   if (/^[\d.]+$/.test(host)) {

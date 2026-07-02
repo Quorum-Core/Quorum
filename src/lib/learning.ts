@@ -64,6 +64,8 @@ function holdsLease(roundId: string, ownerId: string): boolean {
   return !!r;
 }
 
+const PROMOTE_EVIDENCE = 3;  // #71: evidence_count 이 이상이면 lesson→skill 승격
+
 // ── evidence-first 멱등 write ──
 // 1 lease 가드 → 2 span upsert + link claim(fingerprint) → 3 canonical upsert(충돌 처리) + link.memory_id fill + count.
 export function addMemoryIdempotent(l: Lesson, roundId: string, ownerId: string, hashVersion = HASH_VERSION): void {
@@ -131,6 +133,10 @@ function resolveCanonical(
   // evidence_count = 연결된 distinct link 수(증분 X — 복원 중복 방지)
   const cnt = db.prepare(`SELECT COUNT(*) AS c FROM memory_evidence_links WHERE memory_id=?`).get(memoryId) as { c: number };
   db.prepare(`UPDATE agent_memory SET evidence_count=?, last_seen_at=? WHERE id=?`).run(cnt.c, now, memoryId);
+  // #71(IMPROVE): 반복 교훈(evidence_count>=임계) → skill 승격 + confidence↑(identity 불변). retire(반례 obsolete)는 추후.
+  if (cnt.c >= PROMOTE_EVIDENCE) {
+    db.prepare(`UPDATE agent_memory SET current_type='skill', confidence=min(1.0, COALESCE(confidence,0.5)+0.1) WHERE id=? AND current_type<>'skill'`).run(memoryId);
+  }
 }
 
 // orphan link(memory_id NULL) 복원 — link.content 기반으로 canonical 재구성(LLM 불필요).
@@ -202,6 +208,33 @@ export function markFailedValidation(roundId: string, ownerId: string): void {
     db.prepare(`UPDATE meeting_reflections SET status='failed_validation', updated_at=? WHERE round_id=? AND owner_id=?`).run(nowISO(), roundId, ownerId);
   })();
 }
+// #77/#82(IMPROVE retire): 오염 메모리 은퇴 — obsolete(retrieve 제외) + confidence↓. normalized_hash 기준(정규화-동일 retire).
+export function retireMemory(agentId: string, content: string): boolean {
+  const db = getDb();
+  const nh = lessonHash(HASH_VERSION, content);
+  // #87: normalized_hash(현재 버전) OR content(다른 hash_version·legacy) 둘 다 매칭 → 버전 migration 후에도 retire.
+  const r = db.prepare(`UPDATE agent_memory SET status='obsolete', confidence=max(0, COALESCE(confidence,0.5)-0.3) WHERE agent_id=? AND (normalized_hash=? OR content=?) AND status='active'`).run(agentId, nh, content);
+  return r.changes > 0;
+}
+
+// #79: legacy marker에 재구성한 round 경계 저장(from_seq NULL일 때만 — 이미 있으면 보존).
+export function setLegacyBounds(roundId: string, fromSeq: number, toSeq: number): void {
+  const db = getDb();
+  db.prepare(`UPDATE meeting_reflections SET from_seq=?, to_seq=? WHERE round_id=? AND from_seq IS NULL`).run(fromSeq, toSeq, roundId);
+}
+
+// #69: batch9 이전 marker는 from_seq NULL(round 경계 미저장) → superseded(followup 발생) 시 resume하면
+// 현재 chairman 기준으로 옛 round 오염. 경계 복원 불가 → failed terminal로 skip(경계 있는 marker는 false=정상 재개).
+export function failIfLegacyStale(roundId: string): boolean {
+  const db = getDb();
+  const r = db.prepare(`SELECT from_seq FROM meeting_reflections WHERE round_id=?`).get(roundId) as { from_seq?: number | null } | undefined;
+  if (r && (r.from_seq === null || r.from_seq === undefined)) {
+    db.prepare(`UPDATE meeting_reflections SET status='failed', updated_at=? WHERE round_id=? AND status IN ('error','started')`).run(nowISO(), roundId);
+    return true;
+  }
+  return false;
+}
+
 // 현재 round의 attempt_count(재시도 한도 판정용, #30).
 function attemptCount(roundId: string): number {
   const db = getDb();
@@ -271,7 +304,7 @@ export async function runReflectionWithClaim(meetingId: string, version: number,
   const reflectRows = buildReflectRows(allRows, claim.fromSeq, claim.toSeq); // #60: 저장된 round 경계로 필터(followup 무관)
   const ext = await extractLessons(agenda, reflectRows, llm);
   if (!ext.ok) { markError(roundId, claim.ownerId, 'extract failed (llm/parse)'); return; } // #1: 일시 실패 → error(재개), no_lessons 아님
-  const valid = validateLessons(ext.lessons, reflectRows);
+  const valid = validateLessons(ext.lessons, reflectRows, claim.hashVersion);
   for (const l of valid) addMemoryIdempotent(l, roundId, claim.ownerId, claim.hashVersion);
   const hasLinks = countRoundLinks(roundId) > 0;
   if (valid.length === 0 && !hasLinks) {

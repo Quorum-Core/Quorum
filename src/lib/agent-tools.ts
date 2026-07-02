@@ -47,26 +47,41 @@ export function normalizeForScan(s: unknown): string {
 // secret으로 명명된 인자 key — 값이 비어있지 않으면 fail-closed(#57: 짧은 값이라 패턴 미매치여도 차단).
 const SECRET_KEY_NAME = /^\s*(api[_-]?key|secret(_key)?|password|passwd|token|access[_-]?token|refresh[_-]?token|client[_-]?secret|authorization|auth[_-]?token|credentials?|private[_-]?key)\s*$/i;
 
+// prefix 스캔용: 정규화에 더해 모든 공백까지 제거 → "sk-or-v1- ...", "gh p_..." 등 공백 삽입 우회 차단(#2).
+function stripAllWhitespace(s: string): string {
+  return s.replace(/\s+/g, '');
+}
+
+// hex/base64 "덩어리"는 비밀값 문맥(키명 인접)에서만 매칭 — 정상 긴 문자열(해시·ID·긴 검색어)이
+// web_search/MCP를 오탐 차단하지 않도록 좁힘(#2). SG.·PEM처럼 자체로 명백한 룰은 그대로 유지.
+const SECRET_CONTEXT = /(api[_-]?key|secret|token|password|passwd|credential|bearer|authorization|private[_-]?key)/i;
+const HEX_CHUNK = /\b[A-Fa-f0-9]{40,}\b/;
+const B64_CHUNK = /[A-Za-z0-9+/]{40,}={0,2}/;
+
 // 실제 키·토큰 "값"만 탐지(일반 보안 키워드 "api key rotation" 등은 허용 — 오탐 최소화).
 // MCP 포함 모든 도구 인자를 호출 전 스캔해, 회의 로그의 비밀이 외부 도구로 유출되는 것을 차단.
 export function containsSecret(value: unknown): boolean {
   const q = normalizeForScan(value);
   if (!q) return false;
-  return (
-    /sk-or-v1-[a-z0-9]/i.test(q) || /sk-proj-[a-z0-9]/i.test(q) ||
-    /\bsk-[a-z0-9]{20,}/i.test(q) || /\btvly-[a-z0-9]{8,}/i.test(q) ||
-    /bearer\s+[A-Za-z0-9._-]{16,}/i.test(q) ||
+  // prefix 룰은 공백 제거 버전에도 적용 → 문자 사이 공백 삽입 우회 차단(#2).
+  const nsp = stripAllWhitespace(q);
+  // 자체로 비밀값임이 명백한 룰(prefix·PEM·명시 대입) — 공백 제거 버전 병행 검사.
+  const hardMatch = (s: string): boolean =>
+    /sk-or-v1-[a-z0-9]/i.test(s) || /sk-proj-[a-z0-9]/i.test(s) ||
+    /\bsk-[a-z0-9]{20,}/i.test(s) || /\btvly-[a-z0-9]{8,}/i.test(s) ||
+    /bearer\s+[A-Za-z0-9._-]{16,}/i.test(q) ||  // bearer는 공백이 구분자라 원문 q에만
     /\bapi[_-]?key\s*[:=]\s*\S/i.test(q) ||
     // 알려진 토큰 prefix(#57)
-    /\b(AKIA|ASIA)[A-Z0-9]{16}\b/.test(q) ||
-    /\bghp_[A-Za-z0-9]{20,}/.test(q) || /\bgithub_pat_[A-Za-z0-9_]{20,}/.test(q) ||
-    /\bxox[baprs]-[A-Za-z0-9-]{10,}/i.test(q) ||
-    /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/.test(q) ||
-    /\bAIza[A-Za-z0-9_-]{30,}/.test(q) ||
-    /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(q) ||
-    /\b[A-Fa-f0-9]{40,}\b/.test(q) ||
-    /\b[A-Za-z0-9+/]{40,}={0,2}/.test(q)
-  );
+    /\b(AKIA|ASIA)[A-Z0-9]{16}\b/.test(s) ||
+    /\bghp_[A-Za-z0-9]{20,}/.test(s) || /\bgithub_pat_[A-Za-z0-9_]{20,}/.test(s) ||
+    /\bxox[baprs]-[A-Za-z0-9-]{10,}/i.test(s) ||
+    /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/.test(s) ||
+    /\bAIza[A-Za-z0-9_-]{30,}/.test(s) ||
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(s);
+  if (hardMatch(q) || hardMatch(nsp)) return true;
+  // 광폭 hex/base64 덩어리는 키명 인접 문맥이 있을 때만 비밀값으로 간주(오탐 최소화, #2).
+  if (SECRET_CONTEXT.test(q) && (HEX_CHUNK.test(q) || B64_CHUNK.test(q))) return true;
+  return false;
 }
 
 // 도구 인자(중첩 객체/배열 포함)를 재귀 스캔. 깊이 제한으로 순환/폭주 방어.

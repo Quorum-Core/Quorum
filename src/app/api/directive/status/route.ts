@@ -1,19 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { authorized } from '@/lib/api-guard';
 import { dbGet, dbQuery } from '@/lib/db';
 
 export async function GET(req: NextRequest) {
+  if (!authorized(req)) return NextResponse.json({ error: 'forbidden' }, { status: 403 }); // #110: directive+큐 응답(message/response) read 가드
   try {
     const { searchParams } = new URL(req.url);
     const directiveId = searchParams.get('id');
-    if (!directiveId) return NextResponse.json({ error: 'id required' }, { status: 400 });
+    if (!isSafeDirectiveId(directiveId)) return NextResponse.json({ error: 'id invalid' }, { status: 400 });
+    const safeDirectiveId = directiveId.trim();
 
     // Get directive
-    const directive = await dbGet('decisions', directiveId) as Record<string, unknown> | undefined;
+    const directive = await dbGet('decisions', safeDirectiveId) as Record<string, unknown> | undefined;
     if (!directive) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
     // Get chat_queue tasks for this directive
     const tasks = await dbQuery('chat_queue', {
-      like: { metadata: `%"directive_id":"${directiveId}"%` },
+      like: { metadata: `%"directive_id":"${safeDirectiveId}"%` },
       orderBy: 'created_at',
       ascending: true,
     }) as Record<string, unknown>[];
@@ -55,4 +58,8 @@ function parseJson<T>(value: unknown, fallback: T): T {
   if (value && typeof value === 'object') return value as T;
   if (typeof value !== 'string') return fallback;
   try { return JSON.parse(value) as T; } catch { return fallback; }
+}
+
+function isSafeDirectiveId(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9-]{1,100}$/.test(value.trim());
 }
