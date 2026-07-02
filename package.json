@@ -11,7 +11,9 @@
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
     "agents:push": "node scripts/agents-push.mjs",
-    "backfill:memory": "tsx scripts/backfill-memory.ts"
+    "backfill:memory": "tsx scripts/backfill-memory.ts",
+    "eval:run": "tsx --env-file-if-exists=.env.local scripts/eval-experiment.ts",
+    "eval:report": "tsx --env-file-if-exists=.env.local scripts/eval-report.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.3.0",
@@ -50,5 +52,8 @@
   },
   "optionalDependencies": {
     "better-sqlite3": "^12.8.0"
+  },
+  "overrides": {
+    "postcss": "^8.5.10"
   }
 }

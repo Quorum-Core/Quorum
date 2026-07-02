@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useMemo, ReactNode } from 'react';
+import { useState, useEffect, ReactNode } from 'react';
 import { Zap, FileText, TrendingUp, ClipboardList, X } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Card } from '@/components/ui/card';
@@ -48,6 +48,7 @@ const TYPE_STYLE: Record<string, { icon: string; color: string; border: string }
 };
 
 import { Users } from 'lucide-react';
+import { apiFetch } from '@/lib/api-fetch';
 
 const ICON_MAP: Record<string, ReactNode> = {
   zap: <Zap className="w-3 h-3 inline" />,
@@ -94,20 +95,40 @@ export default function TimelineView({ open, onClose, lang = 'ko', onOpenAgenda,
     const m = id.match(/^(dir|d|r|m)-(.+)$/);
     if (!m) return;
     const [, prefix, raw] = m;
+    const removed = events.find((e) => e.id === id);
+    if (!removed) return;
     setEvents((prev) => prev.filter((e) => e.id !== id)); // 낙관적 제거
     try {
+      let res: Response;
       if (prefix === 'd') {
         // decision — 소프트 딜리트(status='deleted', 로드 시 필터)
-        await fetch('/api/decisions', {
+        res = await apiFetch('/api/decisions', {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ id: raw, status: 'deleted' }),
         });
       } else {
         // report/meeting/directive — reports 테이블 행 삭제(status CHECK 제약으로 소프트딜리트 불가)
-        await fetch(`/api/reports?id=${encodeURIComponent(raw)}`, { method: 'DELETE' });
+        res = await apiFetch(`/api/reports?id=${encodeURIComponent(raw)}`, { method: 'DELETE' });
       }
-    } catch { /* noop */ }
+      if (!res.ok) throw new Error(`delete failed: ${res.status}`);
+    } catch {
+      setEvents((prev) => {
+        if (prev.some((e) => e.id === id)) return prev;
+        const restored: TimelineEvent[] = [];
+        let inserted = false;
+        const removedTime = new Date(removed.time).getTime();
+        for (const event of prev) {
+          if (!inserted && removedTime >= new Date(event.time).getTime()) {
+            restored.push(removed);
+            inserted = true;
+          }
+          restored.push(event);
+        }
+        if (!inserted) restored.push(removed);
+        return restored;
+      });
+    }
   };
   const [events, setEvents] = useState<TimelineEvent[]>([]);
   const [loading, setLoading] = useState(true);
@@ -124,10 +145,10 @@ export default function TimelineView({ open, onClose, lang = 'ko', onOpenAgenda,
 
       Promise.all([
       // Decisions
-      fetch('/api/decisions?select=id,title,status,type,priority,current_assignee,created_at,updated_at&order=updated_at.desc&limit=50')
+      apiFetch('/api/decisions?select=id,title,status,type,priority,current_assignee,created_at,updated_at&order=updated_at.desc&limit=50')
         .then(r => r.json()).catch(() => []),
       // Reports
-      fetch('/api/reports?report_type=neq.health_check&select=id,agent_id,title,report_type,status,content,created_at&order=created_at.desc&limit=50')
+      apiFetch('/api/reports?report_type=neq.health_check&select=id,agent_id,title,report_type,status,content,created_at&order=created_at.desc&limit=50')
         .then(r => r.json()).catch(() => []),
       ]).then(([decisionPayload, reports]) => {
         if (cancelled) return;
@@ -151,7 +172,7 @@ export default function TimelineView({ open, onClose, lang = 'ko', onOpenAgenda,
       });
 
       safeReports.forEach((r) => {
-        if (r.report_type === 'directive') {
+        if (r.report_type === 'directive' || r.report_type === 'directive_report') {
           allEvents.push({
             id: `dir-${r.id}`,
             time: r.created_at,
@@ -195,7 +216,7 @@ export default function TimelineView({ open, onClose, lang = 'ko', onOpenAgenda,
   }, [open]);
 
   // Group by date
-  const grouped = useMemo(() => {
+  const grouped = (() => {
     const groups: Record<string, TimelineEvent[]> = {};
     events.forEach(e => {
       const date = formatDate(e.time, ko);
@@ -203,15 +224,15 @@ export default function TimelineView({ open, onClose, lang = 'ko', onOpenAgenda,
       groups[date].push(e);
     });
     return groups;
-  }, [events, ko]);
+  })();
 
   // 저장된 회의 lookup — 안건 정규화 후 부분일치(접두 흔한 어미 차이 허용). 회의 외 항목도 매칭 시 복원.
   const normAgenda = (s: string) => cleanMarkdown(s || '').replace(/^\[회의\]\s*/, '').replace(/\s+/g, ' ').trim().toLowerCase();
-  const savedMeetings = useMemo(() => {
+  const savedMeetings = (() => {
     const list: { key: string; raw: string }[] = [];
     events.forEach(e => { if (e.type === 'meeting' && e.raw) { const k = normAgenda(e.title); if (k) list.push({ key: k, raw: e.raw }); } });
     return list;
-  }, [events]);
+  })();
   const findSavedMeeting = (title: string): string | null => {
     const k = normAgenda(title);
     if (!k) return null;

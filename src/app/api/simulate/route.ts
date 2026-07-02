@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { authorizedBrowser } from '@/lib/api-guard';
+import { rateLimited } from '@/lib/rate-limit';
 export const maxDuration = 60;
 import { SYSTEM_PROMPT_PREFIX, todayContext } from '@/data/personas';
 import { getPersona, getAgentRegistry } from '@/lib/agent-registry';
@@ -72,13 +74,14 @@ You are participating in a group simulation. A scenario has been presented and y
 }
 
 export async function POST(req: NextRequest) {
+  if (!authorizedBrowser(req)) return NextResponse.json({ error: 'forbidden' }, { status: 403 }); // #80
+  { const rl = rateLimited(req, 'simulate', 3); if (rl) return rl; }  // 비용 가드(DoW): IP당 분당 3회(요청당 8 LLM)
   try {
-    const { scenario, type: forceType, agents: forceAgents, lang = 'ko' } = await req.json();
+    const input = sanitizeSimulateBody(await req.json().catch(() => null));
+    if ('error' in input) return NextResponse.json({ error: input.error }, { status: 400 });
+    const { scenario, type: forceType, agents: forceAgents, lang } = input.value;
 
-    if (!scenario) {
-      return NextResponse.json({ error: 'Missing scenario' }, { status: 400 });
-    }
-    if (typeof scenario !== 'string' || scenario.length > 2000) {
+    if (scenario.length > 2000) {
       return NextResponse.json({ error: 'scenario too long' }, { status: 400 });
     }
 
@@ -170,4 +173,38 @@ ${lang === 'ko' ? '위 분석을 종합하여 리더에게 보고할 3줄 요약
     console.error('Simulate API error:', error);
     return NextResponse.json({ error: 'Simulation failed' }, { status: 500 });
   }
+}
+
+function sanitizeSimulateBody(body: unknown): {
+  value: { scenario: string; type?: string; agents?: string[]; lang: 'ko' | 'en' };
+} | { error: string } {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { error: 'invalid body' };
+  const row = body as Record<string, unknown>;
+  if (typeof row.scenario !== 'string' || !row.scenario.trim()) return { error: 'Missing scenario' };
+  if (row.type != null && (typeof row.type !== 'string' || row.type.length > 50)) return { error: 'type invalid' };
+  if (row.lang != null && row.lang !== 'ko' && row.lang !== 'en') return { error: 'lang invalid' };
+  let agents: string[] | undefined;
+  if (row.agents != null) {
+    if (!Array.isArray(row.agents) || row.agents.length > 30) return { error: 'agents invalid' };
+    agents = [];
+    for (const agent of row.agents) {
+      const id = normalizeAgentId(agent);
+      if (!id) return { error: 'agents invalid' };
+      agents.push(id);
+    }
+  }
+  return {
+    value: {
+      scenario: row.scenario.trim(),
+      ...(typeof row.type === 'string' ? { type: row.type } : {}),
+      ...(agents ? { agents: [...new Set(agents)] } : {}),
+      lang: row.lang === 'en' ? 'en' : 'ko',
+    },
+  };
+}
+
+function normalizeAgentId(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9_-]{1,100}$/.test(trimmed) ? trimmed : null;
 }

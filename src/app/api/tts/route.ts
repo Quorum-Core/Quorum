@@ -1,17 +1,22 @@
+import { authorizedBrowser } from '@/lib/api-guard';
+import { rateLimited } from '@/lib/rate-limit';
 
 
 export async function POST(req: Request) {
+  if (!authorizedBrowser(req)) return Response.json({ error: 'forbidden' }, { status: 403 }); // #80
+  { const rl = rateLimited(req, 'tts', 15); if (rl) return rl; }  // 비용 가드(DoW)
   try {
-    const { text, lang } = await req.json();
+    const body = await req.json().catch(() => null);
+    const { text, lang } = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
     
-    if (!text || text.length > 1000) {
+    if (typeof text !== 'string' || !text.trim() || text.length > 1000) {
       return new Response(JSON.stringify({ error: 'Text required (max 1000 chars)' }), { 
         status: 400, headers: { 'Content-Type': 'application/json' } 
       });
     }
 
     const tl = lang === 'en' ? 'en' : 'ko';
-    const encoded = encodeURIComponent(text.slice(0, 200));
+    const encoded = encodeURIComponent(text.trim().slice(0, 200));
     
     // Google Translate TTS — free, natural, edge-compatible
     const url = `https://translate.google.com/translate_tts?ie=UTF-8&tl=${tl}&client=tw-ob&q=${encoded}`;
@@ -21,6 +26,7 @@ export async function POST(req: Request) {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Referer': 'https://translate.google.com/',
       },
+      signal: AbortSignal.timeout(8000),
     });
 
     if (!res.ok) {
@@ -32,7 +38,7 @@ export async function POST(req: Request) {
     return new Response(audio, {
       headers: {
         'Content-Type': 'audio/mpeg',
-        'Cache-Control': 'public, max-age=3600',
+        'Cache-Control': 'private, max-age=3600',
       },
     });
   } catch (err) {

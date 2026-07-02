@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { authorizedBrowser, authorized } from '@/lib/api-guard';
+import { rateLimited } from '@/lib/rate-limit';
 import { SYSTEM_PROMPT_PREFIX, todayContext } from '@/data/personas';
 import { getPersona } from '@/lib/agent-registry';
 import { saveMessage, enqueueChat, getBackendType, dbGet } from '@/lib/db';
@@ -6,6 +8,11 @@ import { untrustedBlock } from '@/lib/untrusted';
 import { callOpenRouterDetailed } from '@/lib/openrouter';
 
 const CHAT_QUEUE_MODE = process.env.CHAT_QUEUE_MODE === 'true';
+
+// #1 입력 크기 상한(비용·프롬프트 폭주 방어): history 항목 content 4000자, 배열 20개, context 직렬화 8000자.
+const HISTORY_ITEM_MAX = 4000;
+const HISTORY_LEN_MAX = 20;
+const CONTEXT_JSON_MAX = 8000;
 
 async function buildSystemPrompt(agentId: string, lang: string) {
   const persona = await getPersona(agentId);
@@ -26,16 +33,35 @@ async function buildSystemPrompt(agentId: string, lang: string) {
 }
 
 // 비신뢰 입력(context)을 system이 아닌 user 메시지에 delimiter로 분리해 prompt injection 차단(토큰 위조 제거 포함)
+// #1: context 직렬화 길이 상한 — 무제한 JSON.stringify로 프롬프트 폭주/비용 소진 차단.
 function wrapWithContext(message: string, context: unknown): string {
   if (!context) return message;
-  return `${untrustedBlock('CONTEXT', JSON.stringify(context))}\n\n${message}`;
+  const serialized = JSON.stringify(context).slice(0, CONTEXT_JSON_MAX);
+  return `${untrustedBlock('CONTEXT', serialized)}\n\n${message}`;
+}
+
+// #1: 클라 history를 role/content로 정규화하고 항목 content·배열 크기 상한 적용(최근 항목 우선).
+function normalizeHistory(history: unknown): { role: string; content: string }[] {
+  if (!Array.isArray(history)) return [];
+  return history
+    .filter((h): h is Record<string, unknown> =>
+      Boolean(h && typeof h === 'object' &&
+        typeof (h as Record<string, unknown>).role === 'string' &&
+        typeof (h as Record<string, unknown>).content === 'string'))
+    .slice(-HISTORY_LEN_MAX)
+    .map((h) => ({
+      role: (h.role as string) === 'assistant' ? 'assistant' : 'user',
+      content: (h.content as string).slice(0, HISTORY_ITEM_MAX),
+    }));
 }
 
 export async function POST(req: NextRequest) {
+  if (!authorizedBrowser(req)) return NextResponse.json({ error: 'forbidden' }, { status: 403 }); // #73
+  { const rl = rateLimited(req, 'chat', 20); if (rl) return rl; }  // 비용 가드(DoW): IP당 분당 20회
   try {
-    const { agentId, message, history, lang = 'ko', context } = await req.json();
-    if (!agentId || !message) return NextResponse.json({ error: 'Missing agentId or message' }, { status: 400 });
-    if (typeof message !== 'string' || message.length > 4000) return NextResponse.json({ error: 'message too long' }, { status: 400 });
+    const input = sanitizeChatBody(await req.json().catch(() => null));
+    if ('error' in input) return NextResponse.json({ error: input.error }, { status: 400 });
+    const { agentId, message, history, lang, context } = input.value;
     if (!(await getPersona(agentId))) return NextResponse.json({ error: 'Unknown agent' }, { status: 404 });
     const userMsg = wrapWithContext(message, context);
     if (CHAT_QUEUE_MODE) {
@@ -44,10 +70,9 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ queueId: item?.id, status: 'pending' });
     }
     const sys = await buildSystemPrompt(agentId, lang);
-    // 현재 세션 이력만 사용 — DB의 옛 대화(정리 전 말투/환각)를 모델에 다시 먹이지 않음
-    const full = (Array.isArray(history) ? history : [])
-      .map((h: Record<string, unknown>) => ({ role: h.role as string, content: h.content as string }))
-      .slice(-10);
+    // 현재 세션 이력만 사용 — DB의 옛 대화(정리 전 말투/환각)를 모델에 다시 먹이지 않음.
+    // #1: 항목 content·배열 크기 상한(normalizeHistory) 적용 후 최근 10개만 모델에 전달.
+    const full = normalizeHistory(history).slice(-10);
     const result = await callOpenRouterDetailed(sys, userMsg, { maxTokens: 4000, maxRetries: 4, history: full });
     if ('error' in result) {
       console.error('OpenRouter error:', result.error);
@@ -62,10 +87,61 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Failed to get response' }, { status: 500 });
   }
 }
+
+function sanitizeChatBody(body: unknown): {
+  value: { agentId: string; message: string; history: Array<{ role: string; content: string }>; lang: string; context: unknown };
+} | { error: string } {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { error: 'invalid body' };
+  const row = body as Record<string, unknown>;
+  const agentId = normalizeAgentId(row.agentId);
+  if (!agentId) return { error: 'agentId invalid' };
+  if (typeof row.message !== 'string' || !row.message.trim() || row.message.length > 4000) return { error: 'message too long' };
+  if (row.lang != null && row.lang !== 'ko' && row.lang !== 'en') return { error: 'lang invalid' };
+  if (row.context != null) {
+    const encoded = JSON.stringify(row.context);
+    if (encoded.length > 10000) return { error: 'context too long' };
+  }
+  return {
+    value: {
+      agentId,
+      message: row.message.trim(),
+      history: sanitizeHistory(row.history),
+      lang: row.lang === 'en' ? 'en' : 'ko',
+      context: row.context,
+    },
+  };
+}
+
+function normalizeAgentId(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9_-]{1,100}$/.test(trimmed) ? trimmed : null;
+}
+
+function sanitizeHistory(history: unknown): Array<{ role: string; content: string }> {
+  if (!Array.isArray(history)) return [];
+  return history
+    .filter((item): item is { role: string; content: string } => {
+      return Boolean(
+        item &&
+        typeof item === 'object' &&
+        typeof (item as Record<string, unknown>).role === 'string' &&
+        typeof (item as Record<string, unknown>).content === 'string'
+      );
+    })
+    .map((item) => ({
+      role: item.role === 'assistant' ? 'assistant' : 'user',
+      content: item.content.slice(0, 2000),
+    }))
+    .slice(-10);
+}
 export async function GET(req: NextRequest) {
+  if (!authorized(req)) return NextResponse.json({ error: 'forbidden' }, { status: 403 }); // #107: 큐 응답 read 가드
   const queueId = new URL(req.url).searchParams.get('id');
   if (!queueId) return NextResponse.json({ error: 'Missing queue id' }, { status: 400 });
-  const item = await dbGet('chat_queue', queueId) as Record<string, unknown> | null;
+  const safeQueueId = queueId.trim();
+  if (!isSafeQueueId(safeQueueId)) return NextResponse.json({ error: 'queue id invalid' }, { status: 400 });
+  const item = await dbGet('chat_queue', safeQueueId) as Record<string, unknown> | null;
   if (!item) return NextResponse.json({ error: 'Queue item not found' }, { status: 404 });
   if (item.status === 'done') {
     return NextResponse.json({ status: 'done', reply: item.response || '', model: item.model });
@@ -77,17 +153,11 @@ export async function GET(req: NextRequest) {
 }
 
 function buildQueueMetadata(history: unknown): Record<string, unknown> | undefined {
-  if (!Array.isArray(history)) return undefined;
-  const clientHistory = history
-    .filter((item): item is { role: string; content: string } => {
-      return Boolean(
-        item &&
-        typeof item === 'object' &&
-        typeof (item as Record<string, unknown>).role === 'string' &&
-        typeof (item as Record<string, unknown>).content === 'string'
-      );
-    })
-    .map((item) => ({ role: item.role === 'assistant' ? 'assistant' : 'user', content: item.content }))
-    .slice(-10);
+  // #1: 큐 경로도 동일 상한 적용(항목 content·배열 크기) 후 최근 10개.
+  const clientHistory = normalizeHistory(history).slice(-10);
   return clientHistory.length ? { client_history: clientHistory } : undefined;
+}
+
+function isSafeQueueId(value: string): boolean {
+  return /^[A-Za-z0-9_-]{1,100}$/.test(value);
 }

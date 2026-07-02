@@ -70,9 +70,13 @@ export function ReportProvider({ children }: { children: ReactNode }) {
 
   // Fetch reports from local API on mount
   useEffect(() => {
-    fetch('/api/reports?limit=50')
+    const controller = new AbortController();
+    let cancelled = false;
+
+    fetch('/api/reports?limit=50', { signal: controller.signal })
       .then(r => r.json())
       .then((data: RawReportRow[]) => {
+        if (cancelled) return;
         if (!Array.isArray(data)) return;
         const mapped: Report[] = data.map(r => {
           const dept = AGENT_DEPT[r.agent_id || ''] || { department: r.department || 'Unknown', floor: 1 };
@@ -98,7 +102,16 @@ export function ReportProvider({ children }: { children: ReactNode }) {
           return [...mapped, ...local];
         });
       })
-      .catch(() => {});
+      .catch((error) => {
+        if ((error as Error)?.name !== 'AbortError') {
+          /* noop */
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, []);
 
   const addReport = useCallback((report: Omit<Report, 'id' | 'timestamp' | 'read'>) => {

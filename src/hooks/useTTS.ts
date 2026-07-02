@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useCallback, useRef, useEffect } from 'react';
+import { apiFetch } from '@/lib/api-fetch';
 
 interface TTSOptions {
   lang?: string;
@@ -10,26 +11,33 @@ export function useTTS(options: TTSOptions = {}) {
   const [speaking, setSpeaking] = useState(false);
   const [supported] = useState(true);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioUrlRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  useEffect(() => {
-    // Cleanup on unmount
-    return () => {
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current = null;
-      }
-      abortRef.current?.abort();
-    };
-  }, []);
-
-  const speak = useCallback(async (text: string, agentId?: string) => {
-    // Stop current
+  const cleanupAudio = useCallback(() => {
     if (audioRef.current) {
+      audioRef.current.onended = null;
+      audioRef.current.onerror = null;
       audioRef.current.pause();
       audioRef.current = null;
     }
+    if (audioUrlRef.current) {
+      URL.revokeObjectURL(audioUrlRef.current);
+      audioUrlRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      cleanupAudio();
+      abortRef.current?.abort();
+    };
+  }, [cleanupAudio]);
+
+  const speak = useCallback(async (text: string, agentId?: string) => {
+    cleanupAudio();
     abortRef.current?.abort();
+    abortRef.current = null;
     window.speechSynthesis?.cancel();
 
     // Clean text
@@ -51,7 +59,7 @@ export function useTTS(options: TTSOptions = {}) {
       const controller = new AbortController();
       abortRef.current = controller;
 
-      const res = await fetch('/api/tts', {
+      const res = await apiFetch('/api/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -66,23 +74,23 @@ export function useTTS(options: TTSOptions = {}) {
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
         const audio = new Audio(url);
+        audioUrlRef.current = url;
         audioRef.current = audio;
 
         audio.onended = () => {
           setSpeaking(false);
-          URL.revokeObjectURL(url);
-          audioRef.current = null;
+          cleanupAudio();
         };
         audio.onerror = () => {
           setSpeaking(false);
-          URL.revokeObjectURL(url);
-          audioRef.current = null;
+          cleanupAudio();
         };
 
         await audio.play();
         return;
       }
     } catch (err) {
+      cleanupAudio();
       if ((err as Error)?.name === 'AbortError') {
         setSpeaking(false);
         return;
@@ -107,17 +115,15 @@ export function useTTS(options: TTSOptions = {}) {
     } else {
       setSpeaking(false);
     }
-  }, [options.lang]);
+  }, [cleanupAudio, options.lang]);
 
   const stop = useCallback(() => {
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
-    }
+    cleanupAudio();
     abortRef.current?.abort();
+    abortRef.current = null;
     window.speechSynthesis?.cancel();
     setSpeaking(false);
-  }, []);
+  }, [cleanupAudio]);
 
   return { speak, stop, speaking, supported };
 }

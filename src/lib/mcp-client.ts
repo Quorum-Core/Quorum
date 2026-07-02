@@ -210,7 +210,7 @@ export async function callMcpTool(name: string, args: Record<string, unknown>): 
         sessionId = initRes.headers.get('mcp-session-id');
         await readCapped(initRes, RESP_CAP * 2).catch(() => ''); // body drain(capped, #62)
         // initialized 통지(세션 확립). 응답 없는 notification — 실패해도 진행.
-        await rpc({ jsonrpc: '2.0', method: 'notifications/initialized' }, sessionId).then((rr) => rr.text().catch(() => '')).catch(() => {});
+        await rpc({ jsonrpc: '2.0', method: 'notifications/initialized' }, sessionId).then((rr) => readCapped(rr, RESP_CAP * 2).catch(() => '')).catch(() => {}); // #70: notification 응답도 cap
       }
     } catch { /* 핸드셰이크 미지원 → 무세션 폴백 */ }
 

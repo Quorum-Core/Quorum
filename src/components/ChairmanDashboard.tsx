@@ -1,5 +1,5 @@
 'use client';
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { X, Clock, CheckCircle2, Zap, Send, FileText, Activity, Users, Trash2, AlertTriangle, RefreshCw, Play, Building2, Circle, XCircle, Timer, Check } from 'lucide-react';
 
 import { useLang } from '@/context/LangContext';
@@ -10,6 +10,7 @@ import { AGENT_ROSTER } from '@/data/agent-config';
 import UserCompanyDashboard from './UserCompanyDashboard';
 import { useCompanies } from '@/hooks/useCompanies';
 import { displayName } from '@/data/agent-names';
+import { apiFetch } from '@/lib/api-fetch';
 
 interface AgentInfo {
   status: 'working' | 'idle' | 'resting';
@@ -87,25 +88,50 @@ export default function ChairmanDashboard({ open, onClose, onOpenMeeting, initia
   const [newAssignees, setNewAssignees] = useState<{ id: string; task: string }[]>([]);
   const [assigneeSearch, setAssigneeSearch] = useState('');
 
+  // 5초 폴링마다 stuck 보정 PATCH/complete POST가 재발사되는 것을 차단 —
+  // 이미 발사한 (id:action) 조합을 기록해 중복 부수효과를 막는다.
+  const patchedRef = useRef<Set<string>>(new Set());
+  const openRef = useRef(open);
+  const lifecycleRef = useRef(0);
+  openRef.current = open;
+
+  useEffect(() => {
+    openRef.current = open;
+    if (!open) lifecycleRef.current += 1;
+  }, [open]);
+
+  useEffect(() => () => {
+    openRef.current = false;
+    lifecycleRef.current += 1;
+  }, []);
+
   const fetchData = useCallback(async (silent = false) => {
-    if (!silent) setLoading(true);
+    const lifecycle = lifecycleRef.current;
+    const canApply = () => openRef.current && lifecycleRef.current === lifecycle;
+    if (!silent && canApply()) setLoading(true);
     try {
       const [statusRes, monRes] = await Promise.all([
-        fetch('/api/agent-status'),
-        fetch('/api/reports?report_type=eq.health_check&order=created_at.desc&limit=1'),
+        apiFetch('/api/agent-status'),
+        apiFetch('/api/reports?report_type=eq.health_check&order=created_at.desc&limit=1'),
       ]);
       
       // Fetch directives from decisions table.
-      const directiveRes = await fetch('/api/decisions?trigger_source=directive&order=created_at.desc&limit=50');
+      const directiveRes = await apiFetch('/api/decisions?trigger_source=directive&order=created_at.desc&limit=50');
       if (directiveRes.ok) {
         const directivePayload = await directiveRes.json();
+        if (!canApply()) return;
         const dirs: Decision[] = Array.isArray(directivePayload) ? directivePayload : directivePayload.decisions || [];
         // Live progress: check directive status route for in_progress directives
         for (const dir of dirs) {
+          if (!canApply()) return;
           // 폴백: 진행률은 완료인데 status가 in_progress로 고착된 지시(완료 PATCH 유실 등) → 직접 완료 처리
           const prog = dir.progress;
           if (dir.status === 'in_progress' && prog && prog.total > 0 && prog.completed >= prog.total) {
-            await fetch('/api/decisions', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: dir.id, status: 'completed' }) }).catch(() => {});
+            const k = `${dir.id}:complete-patch`;
+            if (!patchedRef.current.has(k)) {
+              patchedRef.current.add(k);
+              await apiFetch('/api/decisions', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: dir.id, status: 'completed' }) }).catch(() => {});
+            }
             dir.status = 'completed';
             continue;
           }
@@ -117,16 +143,22 @@ export default function ChairmanDashboard({ open, onClose, onOpenMeeting, initia
             const stuckRef = dir.updated_at || dir.created_at;
             const elapsedStuck = stuckRef ? Date.now() - new Date(stuckRef).getTime() : 0;
             if (dir.status === 'in_progress' && elapsedStuck > 30 * 60 * 1000) {
-              await fetch('/api/decisions', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: dir.id, status: 'pending' }) }).catch(() => {});
+              // stuckRef 갱신 시 재발사 가능하도록 key에 stuckRef 포함(같은 정체 상태 반복 발사만 차단)
+              const k = `${dir.id}:stuck-pending:${stuckRef}`;
+              if (!patchedRef.current.has(k)) {
+                patchedRef.current.add(k);
+                await apiFetch('/api/decisions', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: dir.id, status: 'pending' }) }).catch(() => {});
+              }
               dir.status = 'pending';
               continue;
             }
           }
           if (dir.status === 'in_progress' && dir.trigger_data?.assignees) {
             try {
-              const statusRes = await fetch(`/api/directive/status?id=${encodeURIComponent(dir.id)}`);
+              const statusRes = await apiFetch(`/api/directive/status?id=${encodeURIComponent(dir.id)}`);
               if (!statusRes.ok) continue;
               const statusPayload = await statusRes.json();
+              if (!canApply()) return;
               if (statusPayload.directive?.progress) dir.progress = statusPayload.directive.progress;
 
               const completed = statusPayload.summary?.completed || 0;
@@ -137,41 +169,56 @@ export default function ChairmanDashboard({ open, onClose, onOpenMeeting, initia
                 (statusPayload.allFinished && completed > 0) ||
                 (elapsed > TIMEOUT_MS && completed > 0);
               if (shouldComplete) {
-                const completeRes = await fetch('/api/directive/complete', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ directiveId: dir.id }),
-                });
-                if (completeRes.ok) {
-                  dir.status = 'completed';
-                  // 폴링 중 사용자가 보던 탭을 강제로 done으로 옮기지 않음(탭 튐 방지)
+                const k = `${dir.id}:complete-post`;
+                if (!patchedRef.current.has(k)) {
+                  patchedRef.current.add(k);
+                  const completeRes = await apiFetch('/api/directive/complete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ directiveId: dir.id }),
+                  });
+                  if (completeRes.ok) {
+                    dir.status = 'completed';
+                    // 폴링 중 사용자가 보던 탭을 강제로 done으로 옮기지 않음(탭 튐 방지)
+                  } else {
+                    // 실패 시 재시도 허용 — 다음 폴링에서 다시 시도할 수 있게 마킹 해제
+                    patchedRef.current.delete(k);
+                  }
                 }
               }
             } catch {}
           }
         }
-        // 같은 회의(meeting_id) 또는 같은 제목 지시는 최근 1개만 표시 — 중복(완료+진행중) 제거
-        // meeting_id와 title을 동시에 추적: 한 레코드만 meeting_id 보유(완료본)하고 다른 건
-        // meeting_id 없음/다름(진행중본)이어도 같은 제목이면 묶어서 1개만 노출(불일치 키 버그 방지).
+        if (!canApply()) return;
+        // 중복(완료+진행중) 제거 — meeting_id 우선 dedup. title은 meeting_id 없는 레코드의
+        // 보조키로만 사용(다른 meeting_id·같은 제목의 별개 회의를 하나로 합쳐 숨기는 버그 방지).
         const seenMeeting = new Set<string>();
         const seenTitle = new Set<string>();
         const deduped = dirs.filter((d) => {
           const mid = d.meeting_id ? String(d.meeting_id) : '';
+          if (mid) {
+            if (seenMeeting.has(mid)) return false;
+            seenMeeting.add(mid);
+            return true;
+          }
+          // meeting_id 없을 때만 title 보조키로 dedup
           const titleKey = `t:${cleanMarkdown(d.title || '').trim()}`;
-          if ((mid && seenMeeting.has(mid)) || seenTitle.has(titleKey)) return false;
-          if (mid) seenMeeting.add(mid);
+          if (seenTitle.has(titleKey)) return false;
           seenTitle.add(titleKey);
           return true;
         });
         setDirectives(deduped);
       } else {
-        setDirectives([]);
+        if (canApply()) setDirectives([]);
       }
-      if (statusRes.ok) setAgents((await statusRes.json()).agents || {});
+      if (statusRes.ok) {
+        const statusData = await statusRes.json();
+        if (canApply()) setAgents(statusData.agents || {});
+      }
 
       if (monRes.ok) {
         const monData = await monRes.json();
-        if (monData.length > 0) {
+        if (canApply() && monData.length > 0) {
           const content = monData[0].content || '';
           // Parse key metrics from report content
           const usersMatch = content.match(/총 가입자: (\d+)명/);
@@ -198,7 +245,7 @@ export default function ChairmanDashboard({ open, onClose, onOpenMeeting, initia
         }
       }
     } catch { /* */ }
-    if (!silent) setLoading(false);
+    if (!silent && canApply()) setLoading(false);
   }, []);
 
   const [refreshing, setRefreshing] = useState(false);
@@ -242,7 +289,7 @@ export default function ChairmanDashboard({ open, onClose, onOpenMeeting, initia
     let finalAssignees = newAssignees;
     if (newAssignees.length === 0) {
       try {
-        const assignRes = await fetch('/api/directive/assign', {
+        const assignRes = await apiFetch('/api/directive/assign', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ title: newTitle, description: newDesc }),
         });
@@ -258,7 +305,7 @@ export default function ChairmanDashboard({ open, onClose, onOpenMeeting, initia
         return;
       }
     }
-    const res = await fetch('/api/directives', {
+    const res = await apiFetch('/api/directives', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: newTitle, description: newDesc, assignees: finalAssignees, priority: newPriority }),
     });
@@ -286,7 +333,7 @@ export default function ChairmanDashboard({ open, onClose, onOpenMeeting, initia
 
   const loadDirectiveResponses = async (directiveId: string) => {
     try {
-      const statusRes = await fetch(`/api/directive/status?id=${encodeURIComponent(directiveId)}`);
+      const statusRes = await apiFetch(`/api/directive/status?id=${encodeURIComponent(directiveId)}`);
       if (statusRes.ok) {
         const payload = await statusRes.json();
         const items = (payload.tasks || []) as DirectiveResponseTask[];
@@ -315,7 +362,7 @@ export default function ChairmanDashboard({ open, onClose, onOpenMeeting, initia
     setAdvancing(directiveId);
     try {
       const chairmanNote = decisionNotes[directiveId]?.trim();
-      const res = await fetch('/api/directive/execute', {
+      const res = await apiFetch('/api/directive/execute', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
@@ -325,8 +372,7 @@ export default function ChairmanDashboard({ open, onClose, onOpenMeeting, initia
       });
       
       if (res.ok) {
-        const data = await res.json();
-        console.log(`[check] Directive executed: ${data.tasksCreated} tasks created`);
+        await res.json().catch(() => null);
         // 진행 상황은 대시보드 진행중(active) 탭에서 확인
         onClose();
         setTimeout(() => {
@@ -347,7 +393,7 @@ export default function ChairmanDashboard({ open, onClose, onOpenMeeting, initia
   const deleteDecision = async (id: string) => {
     setAdvancing(id);
     try {
-      await fetch(`/api/decisions?id=eq.${id}`, { method: 'DELETE' });
+      await apiFetch(`/api/decisions?id=eq.${id}`, { method: 'DELETE' });
     } finally { setAdvancing(null); }
     fetchData();
   };
@@ -462,7 +508,7 @@ export default function ChairmanDashboard({ open, onClose, onOpenMeeting, initia
                   e.stopPropagation();
                   setAdvancing(d.id);
                   try {
-                    await fetch('/api/directive/complete', {
+                    await apiFetch('/api/directive/complete', {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify({ directiveId: d.id }),
@@ -540,6 +586,8 @@ export default function ChairmanDashboard({ open, onClose, onOpenMeeting, initia
   const filteredAg = assigneeSearch.trim()
     ? ALL_IDS.filter(id => (id.includes(assigneeSearch.toLowerCase()) || AG[id]?.name.toLowerCase().includes(assigneeSearch.toLowerCase())) && !newAssignees.find(a => a.id === id))
     : [];
+
+  if (!open) return null;
 
   return (
     <div className="fixed inset-0 md:inset-auto md:right-0 md:top-0 md:bottom-0 md:w-[420px] z-50 bg-[#F6F7F9] backdrop-blur-xl border-0 md:border-l md:border-[#16203A]/10 overflow-hidden flex flex-col shadow-[0_0_40px_rgba(22,32,58,0.08)] animate-slideIn">
@@ -800,6 +848,11 @@ export default function ChairmanDashboard({ open, onClose, onOpenMeeting, initia
             })()
           ) : loading ? <div className="text-center text-[#16203A]/55 py-10">Loading...</div> : (
             <div className="flex flex-col gap-2 sm:gap-3">
+
+              {/* 작업 내역 없음 — 지시가 하나도 없을 때 백지 대신 안내 표시 */}
+              {directives.length === 0 && (
+                <div className="p-10 text-center text-[#16203A]/50 text-sm">{ko ? '작업 내역이 없습니다.' : 'No activity yet.'}</div>
+              )}
 
               {/* ROW 1: 지시사항 칸반 보드 — 대기 → 진행 → 완료 */}
               {directives.length > 0 && (

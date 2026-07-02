@@ -84,26 +84,36 @@ export function AgentDetailModal({ agentId, open, onClose, lang = 'ko' }: AgentD
       return;
     }
 
+    const controller = new AbortController();
+    let cancelled = false;
+    const encodedAgentId = encodeURIComponent(agentId);
+
     const fetchAgentData = async () => {
       setLoading(true);
       try {
         const [reportsRes, decisionsRes, chatRes] = await Promise.all([
-          fetch(`/api/reports?agent_id=${agentId}&limit=10`).then(r => r.ok ? r.json() : []),
-          fetch(`/api/decisions?agent_id=${agentId}&limit=10`).then(r => r.ok ? r.json() : []),
-          fetch(`/api/conversations?agent_id=${agentId}&limit=10`).then(r => r.ok ? r.json() : []),
+          fetch(`/api/reports?agent_id=${encodedAgentId}&limit=10`, { signal: controller.signal }).then(r => r.ok ? r.json() : []),
+          fetch(`/api/decisions?agent_id=${encodedAgentId}&limit=10`, { signal: controller.signal }).then(r => r.ok ? r.json() : []),
+          fetch(`/api/conversations?agent_id=${encodedAgentId}&limit=10`, { signal: controller.signal }).then(r => r.ok ? r.json() : []),
         ]);
+        if (cancelled) return;
         const decisionRows = Array.isArray(decisionsRes) ? decisionsRes : decisionsRes?.decisions;
         if (Array.isArray(reportsRes)) setReports(reportsRes);
         if (Array.isArray(decisionRows)) setDecisions(decisionRows);
         if (Array.isArray(chatRes)) setConversations(chatRes);
       } catch (error) {
+        if (cancelled || (error as Error)?.name === 'AbortError') return;
         console.error("Failed to fetch agent data:", error);
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     };
 
     fetchAgentData();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [agentId, open]);
 
   const formatTime = (dateString: string) => {

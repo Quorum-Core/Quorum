@@ -62,8 +62,13 @@ export function AgentRegistryProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let alive = true;
+    const controllers = new Set<AbortController>();
     const load = (fresh = false) => {
-      fetch(fresh ? '/api/agents?fresh=1' : '/api/agents')  // 폴링/포커스는 서버 TTL 우회 → 최신 DB
+      controllers.forEach((controller) => controller.abort());
+      controllers.clear();
+      const controller = new AbortController();
+      controllers.add(controller);
+      fetch(fresh ? '/api/agents?fresh=1' : '/api/agents', { signal: controller.signal })  // 폴링/포커스는 서버 TTL 우회 → 최신 DB
         .then((r) => (r.ok ? r.json() : null))
         .then((d) => {
           if (!alive) return;
@@ -75,14 +80,26 @@ export function AgentRegistryProvider({ children }: { children: ReactNode }) {
             setValue(reg);
           } else setValue((v) => ({ ...v, loading: false }));
         })
-        .catch(() => { if (alive) setValue((v) => ({ ...v, loading: false })); });
+        .catch((error) => {
+          if (!alive || (error as Error)?.name === 'AbortError') return;
+          setValue((v) => ({ ...v, loading: false }));
+        })
+        .finally(() => {
+          controllers.delete(controller);
+        });
     };
     load();  // 첫 페인트는 캐시 OK(빠름)
     // DB 편집 반영 — 주기 폴링 + 탭 포커스 복귀 시 fresh(서버 TTL 우회) → 최악 ≈ 폴링 주기(30s).
     const iv = setInterval(() => load(true), 30_000);
     const onVis = () => { if (document.visibilityState === 'visible') load(true); };
     document.addEventListener('visibilitychange', onVis);
-    return () => { alive = false; clearInterval(iv); document.removeEventListener('visibilitychange', onVis); };
+    return () => {
+      alive = false;
+      controllers.forEach((controller) => controller.abort());
+      controllers.clear();
+      clearInterval(iv);
+      document.removeEventListener('visibilitychange', onVis);
+    };
   }, []);
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

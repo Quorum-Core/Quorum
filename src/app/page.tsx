@@ -10,6 +10,8 @@ import TimelineView from '@/components/TimelineView';
 import { MeetingRoom, type MeetingMessage } from '@/components/MeetingRoom';
 import { floors as floorData, Agent } from '@/data/floors';
 import { displayName } from '@/data/agent-names';
+import { detectTopic, TOPIC_AGENTS } from '@/data/topics';
+import { apiFetch } from '@/lib/api-fetch';
 
 // 칩 → Agent 객체. id(부서 slug)와 코드네임 둘 다로 조회 가능(Phase 4 rename 호환).
 const AGENT_BY_NAME: Record<string, Agent> = {};
@@ -174,7 +176,7 @@ function HomeContent() {
     };
     const load = async () => {
       try {
-        const r = await fetch('/api/decisions?trigger_source=directive&order=created_at.desc&limit=30');
+        const r = await apiFetch('/api/decisions?trigger_source=directive&order=created_at.desc&limit=30');
         const list = await r.json();
         const arr = Array.isArray(list) ? list : (list?.decisions || []);
         const active = arr.filter((d: DbDecision) => d.status === 'in_progress' || d.status === 'pending');
@@ -196,19 +198,53 @@ function HomeContent() {
   // 홈 TF 지시 = 회의로 처리(회의 로직 통일). 서버 백그라운드 회의 시작 + directive 연결.
   const assignDirective = async () => {
     const title = directive.trim();
-    if (!title || team.length === 0) return;
+    if (!title) return;
     const counselyId = AGENT_BY_NAME[COUNSELY.toLowerCase()]?.id || 'lead';
     const skeptyId = AGENT_BY_NAME['risk']?.id || 'risk';
     // 회의 참석자 = 팀 멤버(종합·검증은 회의 흐름에서 제외)
-    const agentIds = team
+    let agentIds = team
       .map((n) => AGENT_BY_NAME[n.toLowerCase()]?.id || n.toLowerCase())
       .filter((id) => id !== counselyId && id !== skeptyId);
+    // 팀 미구성 → 담당 부서 자동 배치. 1순위 LLM(Counsely)이 안건 분석, 실패 시 키워드(topics.ts) 폴백.
+    if (agentIds.length === 0) {
+      try {
+        const res = await apiFetch('/api/directive/assign', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title }),
+        });
+        if (res.ok) {
+          const d = await res.json();
+          agentIds = (Array.isArray(d?.agents) ? d.agents : [])
+            .map((a: { id?: string }) => a?.id)
+            .filter((id: unknown): id is string => typeof id === 'string' && id !== counselyId && id !== skeptyId);
+        }
+      } catch { /* LLM 실패 → 키워드 폴백 */ }
+      if (agentIds.length === 0) {
+        const topic = detectTopic(title);
+        agentIds = (TOPIC_AGENTS[topic] || TOPIC_AGENTS.general || [])
+          .filter((id) => id !== counselyId && id !== skeptyId);
+      }
+    }
     if (agentIds.length === 0) return;
     setDirective('');
+    // 낙관적 세션 job 추가 — DB 폴링(5s) 전이라도 "작업 중" 카드·부서 busy dot 즉시 반영.
+    // 이후 dbActiveDirs가 같은 title로 들어오면 렌더 단계(작업 중 목록)에서 title 기준 dedup됨.
+    setJobs((prev) => {
+      const t = title.trim();
+      if (prev.some((j) => (j.directive || '').trim() === t)) return prev;
+      const optimistic: Job = {
+        id: Date.now(),
+        directive: title,
+        at: '',
+        expanded: false,
+        members: agentIds.map((aid) => ({ id: aid, name: aid, role: 'analysis' as const, status: 'pending' as const })),
+      };
+      return [optimistic, ...prev];
+    });
     // 1) directive 생성(작업중/대시보드 표시용) — 회의가 발언마다 progress·meeting_id 동기화
     let directiveId: string | undefined;
     try {
-      const res = await fetch('/api/directives', {
+      const res = await apiFetch('/api/directives', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title, description: '', assignees: agentIds, priority: 'normal' }),
       });
@@ -216,7 +252,7 @@ function HomeContent() {
     } catch { /* best-effort */ }
     // 2) 회의 시작(서버 백그라운드 + meeting_messages) → 회의실 라이브 구독
     try {
-      const res = await fetch('/api/meeting', {
+      const res = await apiFetch('/api/meeting', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: 'start', agenda: title, agents: agentIds, directiveId }),
       });
@@ -231,10 +267,12 @@ function HomeContent() {
     } catch { /* noop */ }
   };
   const dismissJob = (id: number) => setJobs((prev) => prev.filter((j) => j.id !== id));
-  // 현재 작업 중(분석 진행/대기)인 에이전트 이름 집합 — 부서 그리드에서 강조
+  // 현재 작업 중(분석 진행/대기)인 에이전트 이름 집합 — 부서 그리드에서 강조.
+  // 세션 jobs는 setJobs 호출 경로가 없어 항상 비어 있으므로(회귀), DB 폴링 결과
+  // dbActiveDirs(in_progress·pending 지시)도 함께 반영해 busy dot이 실제로 켜지게 한다.
   const workingNames = new Set<string>();
-  jobs.forEach((j) => {
-    const allDone = j.members.every((m) => m.status === 'done' || m.status === 'error');
+  [...jobs, ...dbActiveDirs].forEach((j) => {
+    const allDone = j.members.length > 0 && j.members.every((m) => m.status === 'done' || m.status === 'error');
     if (!allDone) j.members.forEach((m) => { if (m.status === 'running' || m.status === 'pending') workingNames.add(m.name.toLowerCase()); });
   });
   const [showDashboard, setShowDashboard] = useState(true);
@@ -280,7 +318,7 @@ function HomeContent() {
     const key = (agenda || '').trim();
     if (!key) return null;
     try {
-      const res = await fetch('/api/reports?report_type=eq.meeting&limit=200');
+      const res = await apiFetch('/api/reports?report_type=eq.meeting&limit=200');
       if (!res.ok) return null;
       const list = (await res.json()) as Array<{ title?: string; content?: string }>;
       const strip = (t = '') => t.replace(/^\[회의\]\s*/, '').trim();
@@ -422,7 +460,7 @@ function HomeContent() {
       className={`quorum-main${drawerOpen ? ' quorum-open' : ''}`}
       style={{ minHeight: '100vh', background: C.bg, color: C.ink, fontFamily: FONT, WebkitFontSmoothing: 'antialiased' } as CSSProperties}
     >
-      <style dangerouslySetInnerHTML={{ __html: ZEN_KEYFRAMES }} />
+      <style>{ZEN_KEYFRAMES}</style>
       <div style={{ maxWidth: 1080, margin: '0 auto', padding: '0 28px' }}>
 
         {/* Header — z-index를 우측 채팅 드로어(z-50) 위로 올려 버튼이 가려지지 않게 */}
@@ -575,7 +613,7 @@ function HomeContent() {
                 </span>
                 {/* 팀 멤버 */}
                 {team.length === 0 ? (
-                  <span style={{ fontSize: 12.5, color: C.t(0.4), marginLeft: 4 }}>{koOn ? '부서에서 에이전트를 끌어다 여기에 놓으세요' : 'Drag agents here'}</span>
+                  <span style={{ fontSize: 12.5, color: C.t(0.4), marginLeft: 4 }}>{koOn ? '부서에서 끌어다 놓거나, 안건만 입력하면 자동 배치됩니다' : 'Drag agents here, or just enter an agenda for auto-assignment'}</span>
                 ) : team.map((name) => (
                   <span key={name} style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 500, fontSize: 11, padding: '4px 6px 4px 4px', borderRadius: 999, color: C.t(0.78), background: C.paper(0.95), border: `1px solid ${C.t(0.08)}` }}>
                     <span style={{ width: 18, height: 18, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 600, fontSize: 8, color: '#fff', background: C.ink }}>{dn(name)[0]}</span>{dn(name)}
@@ -595,8 +633,8 @@ function HomeContent() {
                 />
                 <button
                   onClick={assignDirective}
-                  disabled={!directive.trim() || team.length === 0}
-                  style={{ flexShrink: 0, padding: '12px 22px', borderRadius: 12, border: 'none', background: C.ink, color: '#fff', fontFamily: 'inherit', fontWeight: 500, fontSize: 13, cursor: (!directive.trim() || team.length === 0) ? 'default' : 'pointer', opacity: (!directive.trim() || team.length === 0) ? 0.4 : 1 }}
+                  disabled={!directive.trim()}
+                  style={{ flexShrink: 0, padding: '12px 22px', borderRadius: 12, border: 'none', background: C.ink, color: '#fff', fontFamily: 'inherit', fontWeight: 500, fontSize: 13, cursor: !directive.trim() ? 'default' : 'pointer', opacity: !directive.trim() ? 0.4 : 1 }}
                 >
                   {koOn ? '보내기' : 'Send'}
                 </button>

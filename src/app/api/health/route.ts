@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { dbQuery, getBackendType } from '@/lib/db';
+import { authorized } from '@/lib/api-guard';
 import { resumeStuckMeetings, resumeStuckDirectives, resumePendingReflections } from '@/lib/meeting-runner';
 
 interface CheckResult { name: string; status: 'ok' | 'warn' | 'error'; latencyMs: number; detail?: string; httpStatus?: number; }
@@ -15,11 +16,14 @@ async function checkEndpoint(name: string, url: string, options?: RequestInit): 
 
 export async function GET(req: NextRequest) {
   const startTime = Date.now();
+  const detailed = authorized(req);
   // keep-alive cron 핑이 곧 워치독 — 정체된 회의·지시·reflection을 주기 재개(await 안 함, 즉시 200).
-  void resumeStuckMeetings();
-  void resumeStuckDirectives();
-  void resumePendingReflections();  // #1: 미완 REFLECT(error backoff/started 만료) 재개
-  const baseUrl = new URL(req.url).origin;
+  // 공개 health probe는 side-effect 없이 요약만 반환. 워치독 재개는 same-origin 또는 API_TOKEN 요청에서만 실행.
+  if (detailed) {
+    void resumeStuckMeetings();
+    void resumeStuckDirectives();
+    void resumePendingReflections();  // #1: 미완 REFLECT(error backoff/started 만료) 재개
+  }
   const backend = getBackendType();
   const checks: CheckResult[] = [];
 
@@ -51,7 +55,7 @@ export async function GET(req: NextRequest) {
   // opt-in 실검증: ?live=1이면 OpenRouter key 엔드포인트로 키 유효성/크레딧 확인(LLM 호출 아님, 비용 없음).
   // 키 폐기·쿼터 초과를 잡아 'llm_config: ok'의 false healthy를 보완.
   // API_TOKEN 설정 시 Bearer 필요 — 외부의 무인증 키-상태 probe(정보 유출) 차단.
-  const live = new URL(req.url).searchParams.get('live') === '1';
+  const live = detailed && new URL(req.url).searchParams.get('live') === '1';
   if (live) {
     const apiToken = process.env.API_TOKEN;
     if (!apiToken) {
@@ -71,20 +75,15 @@ export async function GET(req: NextRequest) {
       checks.push(r);
     }
   }
-  const apiChecks = await Promise.all([
-    checkEndpoint('directives_api', `${baseUrl}/api/directives`),
-  ]);
-  checks.push(...apiChecks);
-
   const totalMs = Date.now() - startTime;
   const okCount = checks.filter(c => c.status === 'ok').length;
   const errorCount = checks.filter(c => c.status === 'error').length;
   const warnCount = checks.filter(c => c.status === 'warn').length;
 
-  return NextResponse.json({
+  const body = {
     overall: errorCount > 0 ? 'degraded' : warnCount > 0 ? 'warning' : 'healthy',
-    backend, timestamp: new Date().toISOString(), totalMs,
+    timestamp: new Date().toISOString(), totalMs,
     summary: { ok: okCount, warn: warnCount, error: errorCount, total: checks.length },
-    checks, operator: 'Watchy (#19)',
-  });
+  };
+  return NextResponse.json(detailed ? { ...body, backend, checks, operator: 'Watchy (#19)' } : body);
 }

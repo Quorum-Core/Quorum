@@ -1,6 +1,8 @@
 // 회의 → 문서 생성 API. POST { meetingId, format?, type? }.
 // format: 'json'(기본, 미리보기 {document, markdown}) | 'md'(다운로드) | 'docx'(다운로드)
 import { NextRequest, NextResponse } from 'next/server';
+import { authorizedBrowser } from '@/lib/api-guard';
+import { rateLimited } from '@/lib/rate-limit';
 import { dbGet, dbQuery } from '@/lib/db';
 import {
   buildMeetingMinutes,
@@ -30,18 +32,24 @@ function contentDisposition(stem: string, ext: string): string {
 }
 
 export async function POST(req: NextRequest) {
+  if (!authorizedBrowser(req)) return NextResponse.json({ error: 'forbidden' }, { status: 403 }); // #80
+  { const rl = rateLimited(req, 'documents', 10); if (rl) return rl; }  // 비용 가드(DoW)
   try {
-    const { meetingId, format = 'json' } = await req.json();
-    if (!meetingId) return NextResponse.json({ error: 'Missing meetingId' }, { status: 400 });
-    if (!['json', 'md', 'docx'].includes(format)) {
+    const body = await req.json().catch(() => null);
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return NextResponse.json({ error: 'invalid body' }, { status: 400 });
+    const { meetingId, format = 'json' } = body as Record<string, unknown>;
+    if (typeof meetingId !== 'string') return NextResponse.json({ error: 'meetingId invalid' }, { status: 400 });
+    const safeMeetingId = meetingId.trim();
+    if (!isSafeMeetingId(safeMeetingId)) return NextResponse.json({ error: 'meetingId invalid' }, { status: 400 });
+    if (typeof format !== 'string' || !['json', 'md', 'docx'].includes(format)) {
       return NextResponse.json({ error: 'Invalid format' }, { status: 400 });
     }
 
-    const meeting = (await dbGet('meetings', String(meetingId))) as MeetingRow | undefined;
+    const meeting = (await dbGet('meetings', safeMeetingId)) as MeetingRow | undefined;
     if (!meeting) return NextResponse.json({ error: 'Meeting not found' }, { status: 404 });
 
     const messages = (await dbQuery('meeting_messages', {
-      where: { meeting_id: meetingId },
+      where: { meeting_id: safeMeetingId },
       orderBy: 'seq',
       ascending: true,
     })) as MeetingMessageRow[];
@@ -70,7 +78,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ document, markdown: toMarkdown(document) });
   } catch (error) {
     console.error('Document generate error:', error);
-    const detail = error instanceof Error ? error.message : String(error);
-    return NextResponse.json({ error: `문서 생성 오류: ${detail}` }, { status: 500 });
+    return NextResponse.json({ error: '문서 생성 오류' }, { status: 500 });
   }
+}
+
+function isSafeMeetingId(value: string): boolean {
+  return /^[A-Za-z0-9_-]{1,100}$/.test(value);
 }

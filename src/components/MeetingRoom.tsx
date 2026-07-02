@@ -9,12 +9,23 @@ import { floors as floorData } from '@/data/floors';
 import { subscribeMeeting, loadMeetingMessages, loadMeetingStatus, type MeetingMsgRow } from '@/lib/meeting-realtime';
 import { getSpeechRecognition, type SpeechRecognitionLike } from '@/lib/speech';
 import { ReactNode } from 'react';
+import { apiFetch } from '@/lib/api-fetch';
+import { downloadFilenameFromContentDisposition } from '@/lib/content-disposition';
 
 // 회의 참석자 추가용 전체 에이전트 로스터
 const ALL_AGENTS = floorData.flatMap((f) => f.agents);
 
+export type VoteTally = {
+  weights: { for: number; against: number; conditional: number; abstain: number };
+  total: number;
+  winner: 'for' | 'against' | 'conditional' | 'abstain';
+  winnerShare: number;
+  quorum: boolean;
+};
+
 export interface MeetingMessage {
-  type: 'meeting_start' | 'typing' | 'message' | 'summarizing' | 'meeting_end';
+  type: 'meeting_start' | 'typing' | 'message' | 'summarizing' | 'meeting_end' | 'vote';
+  tally?: VoteTally;
   agentId?: string;
   agentName?: string;
   number?: string;
@@ -237,6 +248,7 @@ export function MeetingRoom({ onClose, lang, initialAgenda, initialMessages, ini
   const rowToMsg = useCallback((r: MeetingMsgRow): MeetingMessage => {
     if (r.type === 'meeting_start') return { type: 'meeting_start', agenda, participants: (r.payload?.participants as MeetingMessage['participants']) || [] };
     if (r.type === 'meeting_end') return { type: 'meeting_end', summary: r.summary || '' };
+    if (r.type === 'vote') return { type: 'vote', tally: (r.payload as { tally?: VoteTally })?.tally, message: r.message };
     return { type: 'message', agentId: r.agent_id, agentName: r.agent_name, number: r.number, floor: r.floor, role: r.role, message: r.message };
   }, [agenda]);
 
@@ -320,7 +332,7 @@ export function MeetingRoom({ onClose, lang, initialAgenda, initialMessages, ini
     if (!meetingAgenda.trim()) return;
     setIsRunning(true); setMeetingEnded(false); setSummary(''); setMeetingError(false);
     try {
-      const res = await fetch('/api/meeting', {
+      const res = await apiFetch('/api/meeting', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: 'start', agenda: meetingAgenda }),
       });
@@ -360,7 +372,7 @@ export function MeetingRoom({ onClose, lang, initialAgenda, initialMessages, ini
     setMode('simulation');
 
     try {
-      const res = await fetch('/api/simulate', {
+      const res = await apiFetch('/api/simulate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scenario: scenario.trim(), type: scenarioType, lang }),
@@ -403,7 +415,7 @@ export function MeetingRoom({ onClose, lang, initialAgenda, initialMessages, ini
     if (!meetingId || downloading) return;
     setDownloading(format);
     try {
-      const res = await fetch('/api/documents/generate', {
+      const res = await apiFetch('/api/documents/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ meetingId, format }),
@@ -414,8 +426,10 @@ export function MeetingRoom({ onClose, lang, initialAgenda, initialMessages, ini
         return;
       }
       const blob = await res.blob();
-      const cd = res.headers.get('Content-Disposition') || '';
-      const fname = decodeURIComponent(cd.match(/filename="?([^"]+)"?/)?.[1] || `meeting_minutes.${format}`);
+      const fname = downloadFilenameFromContentDisposition(
+        res.headers.get('Content-Disposition'),
+        `meeting_minutes.${format}`,
+      );
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url; a.download = fname;
@@ -448,7 +462,7 @@ export function MeetingRoom({ onClose, lang, initialAgenda, initialMessages, ini
           alert(lang === 'ko' ? '참석 에이전트가 없어 실행할 수 없습니다.' : 'No participating agents to execute.');
           return;
         }
-        const dRes = await fetch('/api/directives', {
+        const dRes = await apiFetch('/api/directives', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ title, description: desc, assignees, priority: 'high', meetingId: meetingIdRef.current }),
@@ -465,14 +479,14 @@ export function MeetingRoom({ onClose, lang, initialAgenda, initialMessages, ini
           // 회의 화면 그대로 — 각 에이전트의 지시 분석을 회의 발언으로 이어붙임(구독이 실시간 표시)
           setMeetingEnded(false); setSummary(''); setIsRunning(true);
           setMessages(prev => prev.filter(m => m.type !== 'meeting_end'));
-          fetch('/api/meeting', {
+          apiFetch('/api/meeting', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ mode: 'execute', meetingId: mid, directiveId: directive.id, title, description: desc, agents: assignees }),
           }).catch(() => {});
           // 회의실 유지(닫지 않음) — verdict='approved'로 결재 UI는 잠금
         } else {
           // meetingId 없으면(구버전) 기존 백그라운드 execute + 대시보드 이동
-          fetch('/api/directive/execute', {
+          apiFetch('/api/directive/execute', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ directiveId: directive.id }),
           }).catch(() => {});
@@ -483,7 +497,7 @@ export function MeetingRoom({ onClose, lang, initialAgenda, initialMessages, ini
       }
 
       // 거절/완료 → 추가 실행 없이 결재 기록(status=decision) fire-and-forget + 즉시 회의실 닫기
-      fetch('/api/decisions', {
+      apiFetch('/api/decisions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title, description: summary.slice(0, 500), type: 'meeting', status: decision, trigger_source: 'meeting', final_decision: desc }),
@@ -537,17 +551,18 @@ export function MeetingRoom({ onClose, lang, initialAgenda, initialMessages, ini
     setIsRunning(true);
     setMeetingEnded(false);
     try {
-      await fetch('/api/meeting', {
+      const res = await apiFetch('/api/meeting', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: 'followup', meetingId: id, message: msg }),
       });
+      if (!res.ok) { console.error('Followup failed:', res.status); setIsRunning(false); } // #134: 403/400도 running 고착 방지
     } catch (err) {
       console.error('Followup error:', err);
       setIsRunning(false);
     }
   };
 
-  const agentMessages = messages.filter(m => m.type === 'message');
+  const agentMessages = messages.filter(m => m.type === 'message' || m.type === 'vote');
   const participants = messages.find(m => m.type === 'meeting_start')?.participants || [];
 
   // 회의에 참석자 추가 — 서버 followup으로 해당 에이전트 발언 추가
@@ -561,10 +576,11 @@ export function MeetingRoom({ onClose, lang, initialAgenda, initialMessages, ini
     setIsRunning(true);
     setMeetingEnded(false);
     try {
-      await fetch('/api/meeting', {
+      const res = await apiFetch('/api/meeting', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: 'followup', meetingId: id, message: `${agent.name} 참석 요청`, addAgents: [agent.id] }),
       });
+      if (!res.ok) { console.error('Add agent failed:', res.status); setIsRunning(false); } // #134
     } catch (err) {
       console.error('Add agent error:', err);
       setIsRunning(false);
@@ -818,15 +834,50 @@ export function MeetingRoom({ onClose, lang, initialAgenda, initialMessages, ini
 
         {/* Meeting messages */}
         {agentMessages.map((msg, i) => {
+          // 안정 key — 라이브 INSERT가 seq 순으로 재삽입(270행 sort)돼도 인덱스 밀림에 의한
+          // 재마운트/애니메이션 튐 방지. _seq 없으면(정적 메시지) 인덱스로 폴백.
+          const key = msg._seq ?? i;
+          // 가중 투표 결과 — 찬/반/조건부 막대 시각화(#Byzantine 합의).
+          if (msg.type === 'vote' && msg.tally) {
+            const ko = lang === 'ko';
+            const t = msg.tally;
+            const bars: Array<['for' | 'against' | 'conditional', string, string]> = [
+              ['for', ko ? '찬성' : 'For', '#16a34a'], ['against', ko ? '반대' : 'Against', '#dc2626'], ['conditional', ko ? '조건부' : 'Cond.', '#d97706'],
+            ];
+            const pct = (v: number) => t.total > 0 ? Math.round((v / t.total) * 100) : 0;
+            const winLabel = ({ for: ko ? '찬성' : 'For', against: ko ? '반대' : 'Against', conditional: ko ? '조건부' : 'Cond.', abstain: ko ? '유보' : 'Abstain' })[t.winner];
+            return (
+              <div key={key} className="mx-auto w-full max-w-[88%] bg-white border border-[#16203A]/10 rounded-2xl p-3 sm:p-4 animate-fadeInUp">
+                <div className="flex items-center gap-1.5 mb-2 text-[11px] sm:text-xs font-semibold text-[#16203A]">
+                  <BarChart3 className="w-3.5 h-3.5 text-[#2B4C7E]" />
+                  {ko ? '가중 투표' : 'Weighted Vote'}
+                  <span className={`ml-auto px-1.5 py-0.5 rounded text-[9px] font-medium ${t.quorum ? 'bg-emerald-100 text-emerald-700' : 'bg-gray-100 text-gray-500'}`}>
+                    {t.quorum ? `${winLabel} ${Math.round(t.winnerShare * 100)}%` : (ko ? '정족수 미달' : 'No quorum')}
+                  </span>
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  {bars.map(([k, label, color]) => (
+                    <div key={k} className="flex items-center gap-2">
+                      <span className="w-9 sm:w-10 text-[10px] text-[#16203A]/70 shrink-0">{label}</span>
+                      <div className="flex-1 h-3 rounded-full bg-[#16203A]/5 overflow-hidden">
+                        <div className="h-full rounded-full transition-all" style={{ width: `${pct(t.weights[k])}%`, background: color }} />
+                      </div>
+                      <span className="w-8 text-[10px] text-[#16203A]/55 text-right shrink-0">{pct(t.weights[k])}%</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          }
           // 빈 메시지(발언 생성 직전) = 타이핑 표시. 이름/역할+큰 말풍선 대신 아바타+점 컴팩트 행으로.
           const isTyping = !msg.message?.trim();
           if (isTyping && msg.agentId !== 'chairman') {
             return (
-              <div key={i} className="flex items-center gap-2 sm:gap-3 animate-fadeInUp">
+              <div key={key} className="flex items-center gap-2 sm:gap-3 animate-fadeInUp">
                 <div className="shrink-0 w-8 h-8 sm:w-10 sm:h-10 rounded-xl flex items-center justify-center text-sm font-bold text-white bg-[#16203A]">
                   {(displayName(msg.agentId || '', lang === 'en' ? 'en' : 'ko') || msg.agentName || msg.agentId || '?').charAt(0).toUpperCase()}
                 </div>
-                <div className="inline-flex items-center gap-1 w-fit px-3 py-2 rounded-2xl rounded-bl-md bg-white border border-[#16203A]/10">
+                <div className="inline-flex items-center gap-1 w-fit h-8 sm:h-10 px-3 rounded-2xl rounded-bl-md bg-white border border-[#16203A]/10">
                   <div className="w-1.5 h-1.5 rounded-full bg-[#2B4C7E]/60 animate-bounce" style={{ animationDelay: '0ms' }} />
                   <div className="w-1.5 h-1.5 rounded-full bg-[#2B4C7E]/60 animate-bounce" style={{ animationDelay: '150ms' }} />
                   <div className="w-1.5 h-1.5 rounded-full bg-[#2B4C7E]/60 animate-bounce" style={{ animationDelay: '300ms' }} />
@@ -837,7 +888,7 @@ export function MeetingRoom({ onClose, lang, initialAgenda, initialMessages, ini
           }
           return (
           <div
-            key={i}
+            key={key}
             className={`flex ${msg.agentId === 'chairman' ? 'justify-end' : 'justify-start'} animate-fadeInUp`}
           >
             {msg.agentId !== 'chairman' && (
@@ -863,7 +914,7 @@ export function MeetingRoom({ onClose, lang, initialAgenda, initialMessages, ini
                 }`}
               >
                 {msg.agentId === 'chairman' && (
-                  <div className="text-[8px] sm:text-[9px] text-[#2B4C7E]/60 font-medium mb-0.5 sm:mb-1 flex items-center gap-1"><UserCheck className="w-3 h-3" /> {lang === 'ko' ? '사용자' : 'You'}</div>
+                  <div className="text-[8px] sm:text-[9px] text-[#2B4C7E]/60 font-medium mb-0.5 sm:mb-1 flex items-center gap-1"><UserCheck className="w-3 h-3" /> {msg.agentName && msg.agentName !== '사용자' ? msg.agentName : (lang === 'ko' ? '사용자' : 'You')}</div>
                 )}
                 {msg.message?.trim()
                   ? <RenderMarkdown text={localizeAgentNames(msg.message, lang)} />

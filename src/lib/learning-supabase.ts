@@ -65,17 +65,17 @@ async function embedCached(query: string): Promise<number[] | null> {
 
 async function importanceRows(agentId: string): Promise<MemRow[]> {
   const c = db(); if (!c) return [];
+  // #113: 감쇠(stale) 필터를 limit 전(쿼리 안)에서 적용 — 이전엔 limit(15) 뒤 JS 필터라, stale 고중요도 15개가 앞서면
+  //   fresh 메모리가 잘려 5개 미달(sqlite는 SQL WHERE로 필터하므로 비동치였음). KEEP 조건: evidence_count>1 OR last_seen_at>=cutoff.
+  const cutoff = new Date(Date.now() - STALE_DAYS * 86400_000).toISOString();
   const { data, error } = await c.from('agent_memory')
     .select('content, current_type, evidence_count, last_seen_at')
     .eq('agent_id', agentId).eq('status', 'active')
+    .or(`evidence_count.gt.1,last_seen_at.gte.${cutoff}`)
     .order('importance', { ascending: false }).order('evidence_count', { ascending: false }).order('last_seen_at', { ascending: false }) // #47: sqlite와 동치(보강 교훈 우대)
-    .limit(15);
+    .limit(15); // 버퍼(호출부 semantic dedup 후 5개 보장)
   if (error || !data) return [];
-  // 감쇠(#29): evidence_count<=1(미보강) & STALE_DAYS 넘게 미참조 → 제외(자동 obsolete).
-  const cutoff = new Date(Date.now() - STALE_DAYS * 86400_000).toISOString();
-  return (data as Array<MemRow & { evidence_count?: number; last_seen_at?: string }>)
-    .filter((r) => !((r.evidence_count ?? 0) <= 1 && (r.last_seen_at ?? '') < cutoff))
-    .slice(0, 5);
+  return (data as MemRow[]).slice(0, 5);
 }
 
 // RETRIEVE: 시맨틱(query) 결과 + importance fallback 병합·dedup·top-5(#4: partial recall 손실 방지).
@@ -97,6 +97,17 @@ export async function getRetrieveBlockAsync(agentId: string, query?: string): Pr
 }
 
 // WRITE: active 메모리 중 embedding NULL인 row를 CF 임베딩으로 채움. 미설정/비-service면 no-op.
+// #71(IMPROVE): 반복 교훈(evidence_count>=3) → skill 승격(최소구현: type 승격). retire(반례 obsolete)는 추후.
+async function promoteSkills(agentIds: string[]): Promise<void> {
+  const c = db(); if (!c || !agentIds.length) return;
+  // #78: sqlite와 동치 — current_type 승격 + confidence↑(supabase-js는 컬럼 산술 불가 → fetch 후 row별 update).
+  const { data } = await c.from('agent_memory').select('id, confidence')
+    .in('agent_id', Array.from(new Set(agentIds))).gte('evidence_count', 3).eq('status', 'active').neq('current_type', 'skill');
+  for (const r of (data || []) as Array<{ id: number; confidence?: number }>) {
+    await c.from('agent_memory').update({ current_type: 'skill', confidence: Math.min(1, (r.confidence ?? 0.5) + 0.1) }).eq('id', r.id);
+  }
+}
+
 async function embedActiveMemories(agentIds: string[]): Promise<void> {
   const c = db(); if (!c || !embeddingEnabled() || !agentIds.length) return;
   const { data, error } = await c.from('agent_memory')
@@ -144,6 +155,39 @@ async function reflectionAttempts(roundId: string): Promise<number> {
   return Number((data as { attempt_count?: number } | null)?.attempt_count ?? 0);
 }
 
+// #77/#82(IMPROVE retire): 오염 메모리 은퇴 — obsolete + confidence↓. normalized_hash 기준(정규화-동일).
+export async function retireMemory(agentId: string, content: string): Promise<boolean> {
+  const c = db(); if (!c) return false;
+  const nh = lessonHash(HASH_VERSION, content);
+  // #87: normalized_hash(현재 버전) 우선, 없으면 content(다른 hash_version·legacy)로 fallback.
+  let { data } = await c.from('agent_memory').select('id, confidence').eq('agent_id', agentId).eq('normalized_hash', nh).eq('status', 'active');
+  if (!data || !data.length) ({ data } = await c.from('agent_memory').select('id, confidence').eq('agent_id', agentId).eq('content', content).eq('status', 'active'));
+  const rows = (data || []) as Array<{ id: number; confidence?: number }>;
+  for (const r of rows) {
+    await c.from('agent_memory').update({ status: 'obsolete', confidence: Math.max(0, (r.confidence ?? 0.5) - 0.3) }).eq('id', r.id);
+  }
+  return rows.length > 0;
+}
+
+// #79: legacy marker에 재구성한 round 경계 저장(from_seq NULL일 때만).
+export async function setLegacyBounds(roundId: string, fromSeq: number, toSeq: number): Promise<void> {
+  const c = db(); if (!c) return;
+  await c.from('meeting_reflections').update({ from_seq: fromSeq, to_seq: toSeq }).eq('round_id', roundId).is('from_seq', null);
+}
+
+// #69: batch9 이전 from_seq NULL marker는 superseded 시 resume하면 오염 → failed terminal로 skip(경계 있으면 false).
+export async function failIfLegacyStale(roundId: string): Promise<boolean> {
+  const c = db(); if (!c) return false;
+  const { data } = await c.from('meeting_reflections').select('from_seq').eq('round_id', roundId).maybeSingle();
+  const fromSeq = (data as { from_seq?: number | null } | null)?.from_seq;
+  if (data && (fromSeq === null || fromSeq === undefined)) {
+    await c.from('meeting_reflections').update({ status: 'failed', updated_at: new Date().toISOString() })
+      .eq('round_id', roundId).in('status', ['error', 'started']);
+    return true;
+  }
+  return false;
+}
+
 // done 확정 '전' 호출: marker(claim) 선점만(extract 분리). terminal/live-lease면 null.
 // → done 전 항상 marker 존재 → crash 시 started lease 만료 후 워치독 재개(#18/#23 근본해결).
 export async function reserveReflection(meetingId: string, version: number, fromSeq?: number, toSeq?: number): Promise<Claim | null> {
@@ -176,7 +220,7 @@ export async function runReflectionWithClaim(meetingId: string, version: number,
   const rows = buildReflectRows(allRows, claim.fromSeq, claim.toSeq); // #60: 저장된 round 경계로 필터
   const ext = await extractLessons(agenda, rows, llm);
   if (!ext.ok) { await markErrorSupabase(roundId, claim.ownerId, 'extract failed (llm/parse)'); return; } // #1
-  const valid = validateLessons(ext.lessons, rows);
+  const valid = validateLessons(ext.lessons, rows, claim.hashVersion);
   let addFailed = false;  // add 실패 시 finish 금지(link 0개 false done·교훈 유실 방지)
   for (const l of valid) {
     const fp = lessonFingerprint(claim.hashVersion, l.content, l.evidenceSeq, l.excerptStart, l.excerptEnd);
@@ -210,7 +254,8 @@ export async function runReflectionWithClaim(meetingId: string, version: number,
     if (repErr || repData === false) { console.warn('repair not applied (lease lost?):', roundId, repErr?.message); return; } // #1: false도 미완료
     const { data: finData, error: finErr } = await c.rpc('finish_reflection', { p_round_id: roundId, p_owner: claim.ownerId });
     if (finErr || finData === false) { console.warn('finish not applied (lease lost?):', roundId, finErr?.message); return; } // marker 'started' 유지 → 재claim
-    // 임베딩 fire-and-forget(finish 이후 후처리, CF 지연이 회의 종료 안 막음).
+    // finish 이후 후처리 — 임베딩 + skill 승격(#71). fire-and-forget(회의 종료 안 막음).
     void embedActiveMemories(valid.map((l) => l.agentId)).catch((e) => console.error('embed memories error:', roundId, e));
+    void promoteSkills(valid.map((l) => l.agentId)).catch((e) => console.error('promote skills error:', roundId, e));
   }
 }
